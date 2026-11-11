@@ -10,12 +10,10 @@
 
 use std.test
 use std.bytes
-use std.str
 use dns_codec
 use dnsrr
 use dnskey
 use dnsrrsig
-use dnsnsec
 use dnsvalid
 
 // The bytes of base64 text.

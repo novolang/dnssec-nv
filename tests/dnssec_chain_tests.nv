@@ -18,7 +18,6 @@
 
 use std.test
 use std.bytes
-use std.str
 use dns_codec
 use dnsrr
 use dnskey

@@ -74,12 +74,7 @@ pub fn rr(name: dns_codec.DnsName, rtype: Int, rclass: Int, ttl: Int, rdata: [u8
 // `list.append` writes into the list it is given, and no list given to
 // this package is written.
 pub fn cat(a: [u8], b: [u8]) -> [u8]
-    var out: [u8] = list.with_capacity(list.len(a) + list.len(b))
-    for x in a
-        out = list.push(out, x)
-    for x in b
-        out = list.push(out, x)
-    out
+    list.concat(a, b)
 
 // A thirty-two-bit number as four bytes.
 fn be32(v: Int) -> [u8]
@@ -173,10 +168,7 @@ fn fold(b: Int) -> Int
 // RFC 4034 section 6.2 item 2 asks.  A length byte is at most 63, below
 // every letter, so folding never changes one.
 pub fn lower_wire(w: [u8]) -> [u8]
-    var out: [u8] = list.with_capacity(list.len(w))
-    for b in w
-        out = list.push(out, fold(b as Int) as u8)
-    out
+    list.map(w, b => fold(b as Int) as u8)
 
 // The canonical wire form of a name: its labels lowercased.
 pub fn name_wire(name: dns_codec.DnsName) -> [u8]
@@ -197,10 +189,7 @@ pub fn name_text(text: Str) -> dns_codec.DnsName
 
 // The labels of a name, lowercased, from the left.
 fn labels_lower(name: dns_codec.DnsName) -> [[u8]]
-    var out: [[u8]] = []
-    for l in dns_codec.name_labels(name)
-        out = list.push(out, lower_wire(l))
-    out
+    list.map(dns_codec.name_labels(name), l => lower_wire(l))
 
 // Compare two byte strings as left-justified unsigned octet sequences, a
 // string that is a prefix of another sorting first (RFC 4034 section 6.1
@@ -405,9 +394,7 @@ pub fn canonical_rdata(rtype: Int, rdata: [u8]) -> [u8]
 // record that is the same as the one before it dropped (section 6.3: only
 // one of identical records is kept).
 pub fn rrset_rdata_sorted(rrs: [DnsRr]) -> [[u8]]
-    var items: [[u8]] = []
-    for r in rrs
-        items = list.push(items, canonical_rdata(r.rtype, r.rdata))
+    var items: [[u8]] = list.map(rrs, r => canonical_rdata(r.rtype, r.rdata))
     // Insertion sort: an RRset is a handful of records.
     for i in 1..list.len(items)
         var j = i

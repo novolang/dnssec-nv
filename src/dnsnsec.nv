@@ -56,9 +56,7 @@ pub fn denial_name(d: Int) -> Str
 pub fn bitmap_encode(types: [Int]) -> [u8]
     var out: [u8] = []
     for window in 0..256
-        var window_bits: [Int] = []
-        for _ in 0..32
-            window_bits = list.push(window_bits, 0)
+        var window_bits: [Int] = list.zeros(32)
         var top = -1
         for t in types
             if t >= window * 256 and t < window * 256 + 256
@@ -70,8 +68,7 @@ pub fn bitmap_encode(types: [Int]) -> [u8]
         if top >= 0
             out = list.push(out, window as u8)
             out = list.push(out, (top + 1) as u8)
-            for i in 0..top + 1
-                out = list.push(out, window_bits[i] as u8)
+            out = list.concat(out, list.map(list.take(window_bits, top + 1), b => b as u8))
     out
 
 // Whether the type `t` is set in the bitmap `bm`; a bitmap that is
@@ -342,9 +339,7 @@ fn b32_decode(chars: [Int]) -> ?[u8]
 // for a character that is not in the alphabet or bits left over that are
 // not zero.
 pub fn base32hex_decode(text: Str) -> ?[u8]
-    var chars: [Int] = []
-    for i in 0..str.len(text)
-        chars = list.push(chars, str.byte_at_or(text, i, 0))
+    let chars = list.map(list.range(0, str.len(text)), i => str.byte_at_or(text, i, 0))
     b32_decode(chars)
 
 // ── NSEC3 (RFC 5155) ────────────────────────────────────────────────
@@ -443,9 +438,8 @@ pub fn nsec3_rr(r: dnsrr.DnsRr) -> Result<Nsec3Rr, dnskey.DnssecError>
     match nsec3_parse(r.rdata)
         Err(e)  => Err(e)
         Ok(rec) =>
-            var chars: [Int] = []
-            for c in labels[0]
-                chars = list.push(chars, c as Int)
+            let first = labels[0]
+            let chars = list.map(first, c => c as Int)
             match b32_decode(chars)
                 None    => Err(dnskey.DnssecBadName)
                 Some(h) => Ok(Nsec3Rr { owner_hash: h, zone: dnsrr.parent_name(r.name), rec: rec })

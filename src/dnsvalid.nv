@@ -164,7 +164,7 @@ fn zone_keys(rrs: [dnsrr.DnsRr]) -> [dnskey.Dnskey]
         if r.rtype == dnsrr.RR_TYPE_DNSKEY
             match dnskey.dnskey_parse(r.rdata)
                 Err(_) =>
-                    out = out
+                    ()
                 Ok(k)  =>
                     if dnskey.is_zone_key(k) and not dnskey.is_revoked(k)
                         out = list.push(out, k)
@@ -177,7 +177,7 @@ fn signatures_for(rrsigs: [dnsrr.DnsRr], rtype: Int) -> [dnsrrsig.Rrsig]
         if r.rtype == dnsrr.RR_TYPE_RRSIG
             match dnsrrsig.rrsig_parse(r.rdata)
                 Err(_) =>
-                    out = out
+                    ()
                 Ok(s)  =>
                     if s.type_covered == rtype
                         out = list.push(out, s)
@@ -241,7 +241,7 @@ fn parse_ds(rrs: [dnsrr.DnsRr]) -> [dnskey.Ds]
         if r.rtype == dnsrr.RR_TYPE_DS
             match dnskey.ds_parse(r.rdata)
                 Err(_) =>
-                    out = out
+                    ()
                 Ok(d)  =>
                     out = list.push(out, d)
     out
@@ -263,7 +263,7 @@ fn entry_keys(link: ZoneLink, anchors: [dnskey.Ds]) -> [dnskey.Dnskey]
         if r.rtype == dnsrr.RR_TYPE_DNSKEY
             match dnskey.dnskey_parse(r.rdata)
                 Err(_) =>
-                    out = out
+                    ()
                 Ok(k)  =>
                     if dnskey.is_zone_key(k) and not dnskey.is_revoked(k)
                         for d in anchors
