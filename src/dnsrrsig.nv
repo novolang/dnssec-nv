@@ -1,0 +1,288 @@
+// dnsrrsig.nv — the RRSIG record (RFC 4034 section 3) and the check of a
+// signature over an RRset (RFC 4035 section 5.3): the fields, the serial
+// arithmetic of the validity period, the data that was signed, and the
+// verification with RSA/SHA-256 (algorithm 8) through rsa-nv, ECDSA P-256
+// with SHA-256 (13) through p256-nv and Ed25519 (15) through ed25519-nv.
+// The other algorithms answer `VERDICT_ALGORITHM`: RSA/SHA-1 (5, 7) and
+// RSA/SHA-512 (10) need a hash rsa-nv 0.1.0 does not take, ECDSA P-384
+// (14) and Ed448 (16) have no package here.
+//
+// Nothing in this module performs input or output or reads a clock; the
+// time to check against is a number the caller passes.
+
+use std.bytes
+use hashing
+use rsa
+use p256
+use ed25519
+use dns_codec
+use dnsrr
+use dnskey
+
+// ── Verdicts ────────────────────────────────────────────────────────
+
+// The signature is good for the key, the RRset and the time.
+pub const VERDICT_OK = 0
+// The algorithm is not one this package verifies.
+pub const VERDICT_ALGORITHM = 1
+// The signature does not verify, or is not a signature of the length the
+// algorithm gives.
+pub const VERDICT_SIGNATURE = 2
+// The key tag or the algorithm of the signature is not the key's.
+pub const VERDICT_KEY_MISMATCH = 3
+// The signature expired before the time given.
+pub const VERDICT_EXPIRED = 4
+// The signature's inception is after the time given.
+pub const VERDICT_NOT_YET_VALID = 5
+// The key is refused: a public key of a length its algorithm does not
+// have, a point not on the curve, or an RSA modulus below 2048 bits.
+pub const VERDICT_KEY_REFUSED = 6
+// The signature and the RRset do not belong together: a different type,
+// owner, class, more labels than the owner has, or a signer that is not
+// the owner or above it.
+pub const VERDICT_RRSET_MISMATCH = 7
+// The key is not a zone key (RFC 4034 section 2.1.1), or is revoked.
+pub const VERDICT_NOT_ZONE_KEY = 8
+
+// The words for a verdict, for a log line.
+pub fn verdict_name(v: Int) -> Str
+    match v
+        0 => "the signature is valid"
+        1 => "the algorithm is not supported"
+        2 => "the signature does not verify"
+        3 => "the key tag or algorithm is not the key's"
+        4 => "the signature has expired"
+        5 => "the signature is not yet valid"
+        6 => "the key is refused"
+        7 => "the signature does not cover the RRset"
+        8 => "the key is not a zone key or is revoked"
+        _ => "unknown verdict"
+
+// ── The RRSIG ───────────────────────────────────────────────────────
+
+// An RRSIG record's RDATA read into fields.
+pub struct Rrsig
+    type_covered: Int
+    algorithm: Int
+    labels: Int
+    original_ttl: Int
+    expiration: Int
+    inception: Int
+    key_tag: Int
+    signer: dns_codec.DnsName
+    signature: [u8]
+
+// The offset after the uncompressed name at `pos`, or -1.
+fn name_end(rdata: [u8], pos: Int) -> Int
+    var at = pos
+    var end = -1
+    var live = true
+    for _ in 0..130
+        if live and at < list.len(rdata)
+            let len = rdata[at] as Int
+            if len == 0
+                end = at + 1
+                live = false
+            elif len >= 64 or at + 1 + len >= list.len(rdata)
+                live = false
+            else
+                at = at + 1 + len
+        else
+            live = false
+    end
+
+// The sixteen-bit number at `i`.
+fn rd16(b: [u8], i: Int) -> Int
+    (b[i] as Int << 8) | b[i + 1] as Int
+
+// The thirty-two-bit number at `i`.
+fn rd32(b: [u8], i: Int) -> Int
+    (rd16(b, i) << 16) | rd16(b, i + 2)
+
+// A sixteen-bit number as two bytes.
+fn put16(v: Int) -> [u8]
+    [((v >> 8) & 255) as u8, (v & 255) as u8]
+
+// A thirty-two-bit number as four bytes.
+fn put32(v: Int) -> [u8]
+    [((v >> 24) & 255) as u8, ((v >> 16) & 255) as u8, ((v >> 8) & 255) as u8, (v & 255) as u8]
+
+// Read the RDATA of an RRSIG record: 18 bytes of fields, the signer's
+// name, which is not compressed (section 3.1.7), and the signature.
+pub fn rrsig_parse(rdata: [u8]) -> Result<Rrsig, dnskey.DnssecError>
+    if list.len(rdata) < 19
+        return Err(dnskey.DnssecTruncated(list.len(rdata), 19))
+    let end = name_end(rdata, 18)
+    if end < 0
+        return Err(dnskey.DnssecBadName)
+    if end >= list.len(rdata)
+        return Err(dnskey.DnssecTruncated(list.len(rdata), end + 1))
+    match dns_codec.decode_name(rdata, 18)
+        Err(_)   => Err(dnskey.DnssecBadName)
+        Ok(read) =>
+            Ok(Rrsig { type_covered: rd16(rdata, 0), algorithm: rdata[2] as Int, labels: rdata[3] as Int,
+                       original_ttl: rd32(rdata, 4), expiration: rd32(rdata, 8), inception: rd32(rdata, 12),
+                       key_tag: rd16(rdata, 16), signer: read.name,
+                       signature: list.slice(rdata, end, list.len(rdata)) })
+
+// The 18 bytes of fields and the signer's name in canonical form: the
+// RRSIG RDATA without its signature, which the signature covers first
+// (RFC 4035 section 5.3.2).
+pub fn rrsig_prefix(s: Rrsig) -> [u8]
+    var out: [u8] = put16(s.type_covered)
+    out = list.push(out, s.algorithm as u8)
+    out = list.push(out, s.labels as u8)
+    out = dnsrr.cat(out, put32(s.original_ttl))
+    out = dnsrr.cat(out, put32(s.expiration))
+    out = dnsrr.cat(out, put32(s.inception))
+    out = dnsrr.cat(out, put16(s.key_tag))
+    dnsrr.cat(out, dnsrr.name_wire(s.signer))
+
+// The RDATA of an RRSIG.
+pub fn rrsig_rdata(s: Rrsig) -> [u8]
+    var out: [u8] = put16(s.type_covered)
+    out = list.push(out, s.algorithm as u8)
+    out = list.push(out, s.labels as u8)
+    out = dnsrr.cat(out, put32(s.original_ttl))
+    out = dnsrr.cat(out, put32(s.expiration))
+    out = dnsrr.cat(out, put32(s.inception))
+    out = dnsrr.cat(out, put16(s.key_tag))
+    out = dnsrr.cat(out, s.signer.wire)
+    dnsrr.cat(out, s.signature)
+
+// ── Time ────────────────────────────────────────────────────────────
+
+// Whether the serial number `a` is less than or equal to `b` in the
+// arithmetic of RFC 1982 on 32 bits, which is how RFC 4034 section 3.1.5
+// compares the times of a signature: the difference, taken modulo 2^32,
+// is under 2^31.
+pub fn serial_lte(a: Int, b: Int) -> Bool
+    ((b - a) & 0xFFFFFFFF) < 0x80000000
+
+// Whether `now`, in seconds since 1970 (taken modulo 2^32), is between
+// the inception and the expiration of the signature, both included.
+pub fn rrsig_valid_at(s: Rrsig, now: Int) -> Bool
+    let t = now & 0xFFFFFFFF
+    serial_lte(s.inception, t) and serial_lte(t, s.expiration)
+
+// ── The data that was signed ────────────────────────────────────────
+
+// The owner name the signature was made over: the owner of the RRset, or,
+// when the signature's Labels field is smaller than the owner's label
+// count, the wildcard `*.` with the rightmost `labels` labels of the owner
+// (RFC 4035 section 5.3.2).
+pub fn signed_owner(owner: dns_codec.DnsName, labels: Int) -> dns_codec.DnsName
+    if labels < dnsrr.label_count_for_rrsig(owner)
+        dnsrr.wildcard_below(dnsrr.name_suffix(owner, labels))
+    else
+        owner
+
+// The octets that were signed: the RRSIG RDATA without the signature,
+// then the RRset in canonical form and order, each record with the owner
+// as signed and the Original TTL of the signature.  An empty list for an
+// RRset with no records.
+pub fn signed_data(s: Rrsig, rrset: [dnsrr.DnsRr]) -> [u8]
+    if list.len(rrset) == 0
+        return []
+    let first = rrset[0]
+    let owner = dnsrr.name_wire(signed_owner(first.name, s.labels))
+    dnsrr.cat(rrsig_prefix(s),
+        dnsrr.rrset_canonical_wire(owner, first.rtype, first.rclass, s.original_ttl, rrset))
+
+// ── Checking a signature ────────────────────────────────────────────
+
+// The check of the signature bytes `signature` over `data` with key `k`.
+fn verify_crypto(k: dnskey.Dnskey, signature: [u8], data: [u8]) -> Int
+    if k.algorithm == dnskey.ALG_RSASHA256
+        return verify_rsa(k, signature, data)
+    if k.algorithm == dnskey.ALG_ECDSAP256SHA256
+        return verify_p256(k, signature, data)
+    if k.algorithm == dnskey.ALG_ED25519
+        return verify_ed25519(k, signature, data)
+    VERDICT_ALGORITHM
+
+// RSASSA-PKCS1-v1_5 with SHA-256 (RFC 5702).
+fn verify_rsa(k: dnskey.Dnskey, signature: [u8], data: [u8]) -> Int
+    match dnskey.rsa_key_parts(k.key)
+        Err(_)    => VERDICT_KEY_REFUSED
+        Ok(parts) =>
+            match rsa.public_key_from_bytes(bytes.from_byte_list(parts.modulus), bytes.from_byte_list(parts.exponent))
+                Err(_)  => VERDICT_KEY_REFUSED
+                Ok(key) =>
+                    if rsa.verify_pkcs1(key,
+                        rsa.RsaHash.Sha256,
+                        bytes.from_byte_list(data),
+                        bytes.from_byte_list(signature))
+                        VERDICT_OK
+                    else
+                        VERDICT_SIGNATURE
+
+// ECDSA over P-256 with SHA-256 (RFC 6605): the key is x and y, 32 bytes
+// each, and the signature is r and s, 32 bytes each.
+fn verify_p256(k: dnskey.Dnskey, signature: [u8], data: [u8]) -> Int
+    if list.len(k.key) != 64
+        return VERDICT_KEY_REFUSED
+    match p256.public_key_from_bytes(list.slice(k.key, 0, 32), list.slice(k.key, 32, 64))
+        // cov: skip — `public_key_from_bytes` refuses only a coordinate that is not 32 bytes, and both are 32 bytes here
+        Err(_)  => VERDICT_KEY_REFUSED
+        Ok(key) =>
+            match p256.ecdsa_verify(key, bytes.to_byte_list(hashing.sha256(bytes.from_byte_list(data))), signature)
+                Ok(good) =>
+                    if good
+                        VERDICT_OK
+                    else
+                        VERDICT_SIGNATURE
+                Err(e)   =>
+                    match e
+                        BadLength(_, _) => VERDICT_SIGNATURE
+                        _               => VERDICT_KEY_REFUSED
+
+// Ed25519 (RFC 8080): the key is 32 bytes and the signature 64, checked as
+// RFC 8032 section 5.1.7 gives.
+fn verify_ed25519(k: dnskey.Dnskey, signature: [u8], data: [u8]) -> Int
+    match ed25519.verifying_key_from_bytes(k.key)
+        Err(_)  => VERDICT_KEY_REFUSED
+        Ok(key) =>
+            match ed25519.signature_from_bytes(signature)
+                Err(_) => VERDICT_SIGNATURE
+                Ok(sg) =>
+                    match ed25519.verify(key, data, sg, ed25519.Ed25519Strictness.EdRfc8032)
+                        Ok(good) =>
+                            if good
+                                VERDICT_OK
+                            else
+                                VERDICT_SIGNATURE
+                        Err(_)   => VERDICT_KEY_REFUSED
+
+// Check the signature `s` over the RRset `rrset` against the key `k`, at
+// the time `now` in seconds since 1970.  Answers `VERDICT_OK` or the first
+// thing that is wrong, in the order a validator asks: that the signature
+// covers this RRset, that the key is the signature's key, that the key is
+// a zone key, the validity period, and the signature itself.
+pub fn verify(k: dnskey.Dnskey, s: Rrsig, rrset: [dnsrr.DnsRr], now: Int) -> Int
+    if list.len(rrset) == 0
+        return VERDICT_RRSET_MISMATCH
+    let first = rrset[0]
+    for r in rrset
+        if r.rtype != first.rtype or r.rclass != first.rclass or not dns_codec.name_eq(r.name, first.name)
+            return VERDICT_RRSET_MISMATCH
+    if s.type_covered != first.rtype or s.labels > dnsrr.label_count_for_rrsig(first.name) or not dnsrr.is_at_or_below(first.name, s.signer)
+        return VERDICT_RRSET_MISMATCH
+    if s.key_tag != dnskey.key_tag(dnskey.dnskey_rdata(k)) or s.algorithm != k.algorithm
+        return VERDICT_KEY_MISMATCH
+    if not dnskey.is_zone_key(k) or dnskey.is_revoked(k)
+        return VERDICT_NOT_ZONE_KEY
+    if not serial_lte(s.inception, now & 0xFFFFFFFF)
+        return VERDICT_NOT_YET_VALID
+    if not serial_lte(now & 0xFFFFFFFF, s.expiration)
+        return VERDICT_EXPIRED
+    verify_signature(k, s, rrset)
+
+// Check the signature bytes of `s` over the data that `signed_data` makes
+// of `s` and the RRset, with the key `k`, and nothing else: not the type,
+// the owner, the key tag, the Labels field or the time. `VERDICT_OK`, or
+// `VERDICT_SIGNATURE`, `VERDICT_KEY_REFUSED` or `VERDICT_ALGORITHM`. `verify`
+// ends with this call, and a caller that has made those checks itself, or
+// that wants only the cryptography, makes it directly.
+pub fn verify_signature(k: dnskey.Dnskey, s: Rrsig, rrset: [dnsrr.DnsRr]) -> Int
+    verify_crypto(k, s.signature, signed_data(s, rrset))

@@ -1,0 +1,453 @@
+// dnsrr.nv — the resource record as DNSSEC sees it: an owner name, a type,
+// a class, a TTL and the bytes of the RDATA, with the canonical form and
+// the canonical order of RFC 4034 section 6 and the corrections of RFC
+// 6840 section 5.1.
+//
+// A name is a `DnsName` of dns-codec-nv, the uncompressed wire bytes of
+// its labels.  RDATA is held as the wire bytes of the record, names
+// inside it uncompressed, so a record read from a message by the codec
+// and a record written from text are the same value.  `rr_of_record` makes
+// one from a codec `DnsRecord`.
+//
+// Nothing in this module performs input or output, reads a clock or
+// allocates beyond the lists it answers.
+
+use dns_codec
+
+// ── Types and classes ───────────────────────────────────────────────
+
+// The class of the Internet, the only one DNSSEC is deployed in.
+pub const RR_CLASS_IN = 1
+
+// A.
+pub const RR_TYPE_A = 1
+// NS.
+pub const RR_TYPE_NS = 2
+// CNAME.
+pub const RR_TYPE_CNAME = 5
+// SOA.
+pub const RR_TYPE_SOA = 6
+// PTR.
+pub const RR_TYPE_PTR = 12
+// MX.
+pub const RR_TYPE_MX = 15
+// TXT.
+pub const RR_TYPE_TXT = 16
+// AAAA.
+pub const RR_TYPE_AAAA = 28
+// SRV.
+pub const RR_TYPE_SRV = 33
+// DNAME.
+pub const RR_TYPE_DNAME = 39
+// DS (RFC 4034 section 5).
+pub const RR_TYPE_DS = 43
+// RRSIG (RFC 4034 section 3).
+pub const RR_TYPE_RRSIG = 46
+// NSEC (RFC 4034 section 4).
+pub const RR_TYPE_NSEC = 47
+// DNSKEY (RFC 4034 section 2).
+pub const RR_TYPE_DNSKEY = 48
+// NSEC3 (RFC 5155 section 3).
+pub const RR_TYPE_NSEC3 = 50
+// NSEC3PARAM (RFC 5155 section 4).
+pub const RR_TYPE_NSEC3PARAM = 51
+// CDS (RFC 7344 section 3.1).
+pub const RR_TYPE_CDS = 59
+// CDNSKEY (RFC 7344 section 3.2).
+pub const RR_TYPE_CDNSKEY = 60
+
+// ── The record ──────────────────────────────────────────────────────
+
+// One resource record.
+pub struct DnsRr
+    name: dns_codec.DnsName
+    rtype: Int
+    rclass: Int
+    ttl: Int
+    rdata: [u8]
+
+// A record from its parts.
+pub fn rr(name: dns_codec.DnsName, rtype: Int, rclass: Int, ttl: Int, rdata: [u8]) -> DnsRr
+    DnsRr { name: name, rtype: rtype, rclass: rclass, ttl: ttl, rdata: rdata }
+
+// The bytes of `a` followed by the bytes of `b`, in a list of their own:
+// `list.append` writes into the list it is given, and no list given to
+// this package is written.
+pub fn cat(a: [u8], b: [u8]) -> [u8]
+    var out: [u8] = list.with_capacity(list.len(a) + list.len(b))
+    for x in a
+        out = list.push(out, x)
+    for x in b
+        out = list.push(out, x)
+    out
+
+// A thirty-two-bit number as four bytes.
+fn be32(v: Int) -> [u8]
+    [((v >> 24) & 255) as u8, ((v >> 16) & 255) as u8, ((v >> 8) & 255) as u8, (v & 255) as u8]
+
+// A sixteen-bit number as two bytes.
+fn be16(v: Int) -> [u8]
+    [((v >> 8) & 255) as u8, (v & 255) as u8]
+
+// The wire bytes of the RDATA a codec variant holds.
+fn rdata_of(data: dns_codec.DnsRdata) -> [u8]
+    match data
+        RdataA(octets)       => list.clone(octets)
+        RdataAaaa(octets)    => list.clone(octets)
+        RdataCname(target)   => list.clone(target.wire)
+        RdataNs(target)      => list.clone(target.wire)
+        RdataPtr(target)     => list.clone(target.wire)
+        RdataMx(value)       => cat(be16(value.preference), value.exchange.wire)
+        RdataTxt(strings)    => txt_wire(strings)
+        RdataSrv(value)      => srv_wire(value)
+        RdataSoa(value)      => soa_wire(value)
+        RdataOpt(options)    => opt_wire(options)
+        RdataUnknown(t, raw) => list.clone(raw)
+
+// The character-strings of a TXT record, each with its length byte.
+fn txt_wire(strings: [[u8]]) -> [u8]
+    var out: [u8] = []
+    for s in strings
+        out = list.push(out, list.len(s) as u8)
+        out = cat(out, s)
+    out
+
+// The RDATA of an SRV record.
+fn srv_wire(v: dns_codec.DnsSrv) -> [u8]
+    cat(cat(cat(be16(v.priority), be16(v.weight)), be16(v.port)), v.target.wire)
+
+// The RDATA of an SOA record.
+fn soa_wire(v: dns_codec.DnsSoa) -> [u8]
+    var out: [u8] = cat(v.primary.wire, v.mailbox.wire)
+    out = cat(out, be32(v.serial))
+    out = cat(out, be32(v.refresh))
+    out = cat(out, be32(v.retry))
+    out = cat(out, be32(v.expire))
+    out = cat(out, be32(v.minimum))
+    out
+
+// The RDATA of an OPT pseudo-record: its options.
+fn opt_wire(options: [dns_codec.DnsOption]) -> [u8]
+    var out: [u8] = []
+    for o in options
+        out = cat(out, be16(o.code))
+        out = cat(out, be16(list.len(o.data)))
+        out = cat(out, o.data)
+    out
+
+// The type number a codec variant stands for.
+fn type_of_rdata(data: dns_codec.DnsRdata) -> Int
+    match data
+        RdataA(_)          => RR_TYPE_A
+        RdataAaaa(_)       => RR_TYPE_AAAA
+        RdataCname(_)      => RR_TYPE_CNAME
+        RdataNs(_)         => RR_TYPE_NS
+        RdataPtr(_)        => RR_TYPE_PTR
+        RdataMx(_)         => RR_TYPE_MX
+        RdataTxt(_)        => RR_TYPE_TXT
+        RdataSrv(_)        => RR_TYPE_SRV
+        RdataSoa(_)        => RR_TYPE_SOA
+        RdataOpt(_)        => 41
+        RdataUnknown(t, _) => t
+
+// A record from one the codec decoded: the DNSSEC record types arrive
+// from the codec as `RdataUnknown` with their bytes, which is what this
+// package reads.
+pub fn rr_of_record(rec: dns_codec.DnsRecord) -> DnsRr
+    DnsRr { name: rec.name,
+        rtype: type_of_rdata(rec.data),
+        rclass: dns_codec.class_code(rec.record_class),
+        ttl: rec.ttl,
+        rdata: rdata_of(rec.data) }
+
+// ── Names ───────────────────────────────────────────────────────────
+
+// A byte with ASCII upper case folded to lower case.
+fn fold(b: Int) -> Int
+    if b >= 'A' and b <= 'Z'
+        b + 32
+    else
+        b
+
+// The wire bytes of a name with ASCII upper case folded to lower case, as
+// RFC 4034 section 6.2 item 2 asks.  A length byte is at most 63, below
+// every letter, so folding never changes one.
+pub fn lower_wire(w: [u8]) -> [u8]
+    var out: [u8] = list.with_capacity(list.len(w))
+    for b in w
+        out = list.push(out, fold(b as Int) as u8)
+    out
+
+// The canonical wire form of a name: its labels lowercased.
+pub fn name_wire(name: dns_codec.DnsName) -> [u8]
+    lower_wire(name.wire)
+
+// The name made of `labels`, or the root for a list that makes no name.
+pub fn name_of(labels: [[u8]]) -> dns_codec.DnsName
+    match dns_codec.name_of_labels(labels)
+        Ok(n)  => n
+        Err(_) => dns_codec.root_name()
+
+// A name from presentation text such as `www.example.com.`; the root for
+// text that is no name.
+pub fn name_text(text: Str) -> dns_codec.DnsName
+    match dns_codec.name_from_text(text)
+        Ok(n)  => n
+        Err(_) => dns_codec.root_name()
+
+// The labels of a name, lowercased, from the left.
+fn labels_lower(name: dns_codec.DnsName) -> [[u8]]
+    var out: [[u8]] = []
+    for l in dns_codec.name_labels(name)
+        out = list.push(out, lower_wire(l))
+    out
+
+// Compare two byte strings as left-justified unsigned octet sequences, a
+// string that is a prefix of another sorting first (RFC 4034 section 6.1
+// and 6.3): -1, 0 or 1.
+pub fn bytes_cmp(a: [u8], b: [u8]) -> Int
+    let n = if list.len(a) < list.len(b)
+        list.len(a)
+    else
+        list.len(b)
+    for i in 0..n
+        if (a[i] as Int) < (b[i] as Int)
+            return -1
+        if (a[i] as Int) > (b[i] as Int)
+            return 1
+    if list.len(a) < list.len(b)
+        -1
+    elif list.len(a) > list.len(b)
+        1
+    else
+        0
+
+// The canonical order of two names (RFC 4034 section 6.1): compare the
+// labels from the rightmost, each as a lowercase octet string; a name
+// that is a suffix of another sorts first.  -1, 0 or 1.
+pub fn name_cmp(a: dns_codec.DnsName, b: dns_codec.DnsName) -> Int
+    let la = labels_lower(a)
+    let lb = labels_lower(b)
+    let na = list.len(la)
+    let nb = list.len(lb)
+    let n = if na < nb
+        na
+    else
+        nb
+    for i in 0..n
+        let c = bytes_cmp(la[na - 1 - i], lb[nb - 1 - i])
+        if c != 0
+            return c
+    if na < nb
+        -1
+    elif na > nb
+        1
+    else
+        0
+
+// Whether `child` is `parent` or a name below it, ignoring case.
+pub fn is_at_or_below(child: dns_codec.DnsName, parent: dns_codec.DnsName) -> Bool
+    let lc = labels_lower(child)
+    let lp = labels_lower(parent)
+    let nc = list.len(lc)
+    let np = list.len(lp)
+    if np > nc
+        return false
+    for i in 0..np
+        if bytes_cmp(lc[nc - 1 - i], lp[np - 1 - i]) != 0
+            return false
+    true
+
+// Whether `child` is a name strictly below `parent`.
+pub fn is_below(child: dns_codec.DnsName, parent: dns_codec.DnsName) -> Bool
+    is_at_or_below(child, parent) and dns_codec.name_label_count(child) > dns_codec.name_label_count(parent)
+
+// Whether two names are the same, ignoring case.
+pub fn name_same(a: dns_codec.DnsName, b: dns_codec.DnsName) -> Bool
+    dns_codec.name_eq(a, b)
+
+// The name without its leftmost label; the root for the root.
+pub fn parent_name(name: dns_codec.DnsName) -> dns_codec.DnsName
+    let labels = dns_codec.name_labels(name)
+    if list.len(labels) == 0
+        dns_codec.root_name()
+    else
+        name_of(list.slice(labels, 1, list.len(labels)))
+
+// The rightmost `count` labels of a name.
+pub fn name_suffix(name: dns_codec.DnsName, count: Int) -> dns_codec.DnsName
+    let labels = dns_codec.name_labels(name)
+    let n = list.len(labels)
+    if count >= n
+        name
+    elif count <= 0
+        dns_codec.root_name()
+    else
+        name_of(list.slice(labels, n - count, n))
+
+// The wildcard name `*.name`.
+pub fn wildcard_below(name: dns_codec.DnsName) -> dns_codec.DnsName
+    name_of(list.concat([[42 as u8]], dns_codec.name_labels(name)))
+
+// Whether the leftmost label of a name is `*`.
+pub fn is_wildcard(name: dns_codec.DnsName) -> Bool
+    let labels = dns_codec.name_labels(name)
+    list.len(labels) > 0 and list.len(labels[0]) == 1 and (labels[0][0] as Int) == 42
+
+// The number of labels of a name for the Labels field of an RRSIG (RFC
+// 4034 section 3.1.3): the root is not counted, nor a leading `*`.
+pub fn label_count_for_rrsig(name: dns_codec.DnsName) -> Int
+    let n = dns_codec.name_label_count(name)
+    if is_wildcard(name)
+        n - 1
+    else
+        n
+
+// ── The canonical RDATA (RFC 4034 section 6.2 item 3, RFC 6840 5.1) ──
+
+// The shape of the RDATA of a type, for the names in it that are folded
+// to lower case: -1 is a domain name, -2 a character-string, -3 the rest
+// of the RDATA as it is, and a number from 0 up that many bytes as they
+// are.  NSEC is not in the list, because RFC 6840 section 5.1 says its
+// next domain name is not folded; RRSIG is, because it says its signer's
+// name is.  A6 (RFC 2874) is not here and is carried as it came.
+fn rdata_shape(rtype: Int) -> [Int]
+    match rtype
+        2  => [-1]
+        3  => [-1]
+        4  => [-1]
+        5  => [-1]
+        6  => [-1, -1, 20]
+        7  => [-1]
+        8  => [-1]
+        9  => [-1]
+        12 => [-1]
+        14 => [-1, -1]
+        15 => [2, -1]
+        17 => [-1, -1]
+        18 => [2, -1]
+        21 => [2, -1]
+        24 => [18, -1, -3]
+        26 => [2, -1, -1]
+        30 => [-1, -3]
+        33 => [6, -1]
+        35 => [4, -2, -2, -2, -1]
+        36 => [2, -1]
+        39 => [-1]
+        46 => [18, -1, -3]
+        _  => [-3]
+
+// The bytes `n` or fewer from `pos` of `rdata`, copied as they are.
+fn copy_raw(rdata: [u8], pos: Int, n: Int) -> [u8]
+    let end = if pos + n > list.len(rdata)
+        list.len(rdata)
+    else
+        pos + n
+    if pos >= end
+        []
+    else
+        list.slice(rdata, pos, end)
+
+// How many bytes the domain name at `pos` of `rdata` takes, the root
+// byte included, or what is left of the RDATA when it has no end.
+fn name_extent(rdata: [u8], pos: Int) -> Int
+    var at = pos
+    var live = true
+    for _ in 0..130
+        if live and at < list.len(rdata)
+            let len = rdata[at] as Int
+            if len == 0
+                at = at + 1
+                live = false
+            elif len >= 64
+                at = list.len(rdata)
+                live = false
+            else
+                at = at + 1 + len
+        else
+            live = false
+    if at > list.len(rdata)
+        list.len(rdata) - pos
+    else
+        at - pos
+
+// The RDATA of a record in canonical form: the names in the types listed
+// above with ASCII upper case folded to lower case.  A name is expanded
+// already, because the RDATA is held uncompressed.
+pub fn canonical_rdata(rtype: Int, rdata: [u8]) -> [u8]
+    var out: [u8] = []
+    var pos = 0
+    for token in rdata_shape(rtype)
+        if token >= 0
+            out = cat(out, copy_raw(rdata, pos, token))
+            pos = pos + token
+        elif token == -1
+            let n = name_extent(rdata, pos)
+            out = cat(out, lower_wire(copy_raw(rdata, pos, n)))
+            pos = pos + n
+        elif token == -2
+            let len = if pos < list.len(rdata)
+                rdata[pos] as Int
+            else
+                0
+            out = cat(out, copy_raw(rdata, pos, 1 + len))
+            pos = pos + 1 + len
+        else
+            out = cat(out, copy_raw(rdata, pos, list.len(rdata) - pos))
+            pos = list.len(rdata)
+    if pos < list.len(rdata)
+        out = cat(out, copy_raw(rdata, pos, list.len(rdata) - pos))
+    out
+
+// ── The canonical form of an RRset (RFC 4034 section 6.3) ───────────
+
+// The canonical RDATA of each record of an RRset, in canonical order, a
+// record that is the same as the one before it dropped (section 6.3: only
+// one of identical records is kept).
+pub fn rrset_rdata_sorted(rrs: [DnsRr]) -> [[u8]]
+    var items: [[u8]] = []
+    for r in rrs
+        items = list.push(items, canonical_rdata(r.rtype, r.rdata))
+    // Insertion sort: an RRset is a handful of records.
+    for i in 1..list.len(items)
+        var j = i
+        for _ in 0..j
+            if j > 0 and bytes_cmp(items[j - 1], items[j]) > 0
+                var swap = list.clone(items[j])
+                items[j] = list.clone(items[j - 1])
+                items[j - 1] = swap
+                j = j - 1
+    var out: [[u8]] = []
+    for it in items
+        if list.len(out) == 0 or bytes_cmp(out[list.len(out) - 1], it) != 0
+            out = list.push(out, list.clone(it))
+    out
+
+// The wire bytes of one record in canonical form: the owner given (it
+// has been lowercased and its wildcard restored by the caller), the type,
+// the class, the TTL given and the RDATA with its length.
+pub fn rr_canonical_wire(owner: [u8], rtype: Int, rclass: Int, ttl: Int, rdata: [u8]) -> [u8]
+    var out: [u8] = list.clone(owner)
+    out = cat(out, be16(rtype))
+    out = cat(out, be16(rclass))
+    out = cat(out, be32(ttl))
+    out = cat(out, be16(list.len(rdata)))
+    cat(out, rdata)
+
+// The canonical wire form of every record of the RRset, concatenated in
+// canonical order, with `owner` as the owner name of each and `ttl` as
+// its TTL.  All the records are taken to have `rtype` and `rclass`.
+pub fn rrset_canonical_wire(owner: [u8], rtype: Int, rclass: Int, ttl: Int, rrs: [DnsRr]) -> [u8]
+    var out: [u8] = []
+    for rd in rrset_rdata_sorted(rrs)
+        out = cat(out, rr_canonical_wire(owner, rtype, rclass, ttl, rd))
+    out
+
+// The records of `rrs` that have the owner `name`, the type `rtype` and
+// the class `rclass`.
+pub fn rrset_of(rrs: [DnsRr], name: dns_codec.DnsName, rtype: Int, rclass: Int) -> [DnsRr]
+    var out: [DnsRr] = []
+    for r in rrs
+        if r.rtype == rtype and r.rclass == rclass and dns_codec.name_eq(r.name, name)
+            out = list.push(out, r)
+    out

@@ -1,0 +1,617 @@
+// dnssec_chain_tests.nv — the validation of a chain of keys from a trust
+// anchor to a signed answer, and the four states of RFC 4033 section 5.
+//
+// The zones are made by `tests/make_chain_vectors.py`, a signer that shares
+// no code with the package: it builds the canonical form of RFC 4034
+// section 6 itself and signs with the `cryptography` package.  The chain is
+//
+//   .            DNSKEY 257 3 15   Ed25519, the key the trust anchor names
+//   example.     DNSKEY 257 3 13   ECDSA P-256, its DS in the root signed by the root key
+//   sub.example. DNSKEY 257 3 8    RSA-2048 with SHA-256, its DS signed by the example key
+//
+// and the answers are www.sub.example. A, a wildcard expansion of
+// *.sub.example. TXT at a.b.sub.example., and an MX whose exchange has
+// capital letters.  All signatures are valid from 1700000000 to
+// 1702592000; the tests use 1701000000 unless they say otherwise.  The RSA
+// key is generated afresh by every run of the script, so the vectors below
+// are one run's output and its key tag, 40727, belongs to that run.
+
+use std.test
+use std.bytes
+use std.str
+use dns_codec
+use dnsrr
+use dnskey
+use dnsrrsig
+use dnsvalid
+
+// The bytes of hexadecimal text.
+fn hexb(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(text) ?? bytes.zeros(0))
+
+// A name from presentation text.
+fn nm(text: Str) -> dns_codec.DnsName
+    dnsrr.name_text(text)
+
+// A record of the given owner, type, TTL and RDATA in hexadecimal.
+fn rec(owner: Str, rtype: Int, ttl: Int, rdata_hex: Str) -> dnsrr.DnsRr
+    dnsrr.rr(nm(owner), rtype, 1, ttl, hexb(rdata_hex))
+
+// An RRSIG record of the given owner covering a type, the RDATA in hexadecimal.
+fn sigrec(owner: Str, rdata_hex: Str) -> dnsrr.DnsRr
+    dnsrr.rr(nm(owner), 46, 1, 3600, hexb(rdata_hex))
+
+// The DS record the trust anchor is.
+fn anchor() -> dnskey.Ds
+    match dnskey.ds_parse(hexb(v_root_anchor_ds()))
+        Ok(d)  => d
+        Err(_) => dnskey.Ds { key_tag: 0, algorithm: 0, digest_type: 0, digest: [] }
+
+// The three links of the chain.
+fn link_root() -> dnsvalid.ZoneLink
+    dnsvalid.ZoneLink { zone: nm("."),
+        dnskeys: [rec(".", 48, 3600, v_root_dnskey())],
+        dnskey_sigs: [sigrec(".", v_root_dnskey_sig())],
+        ds: [],
+        ds_sigs: [],
+        ds_absent: false }
+
+fn link_example() -> dnsvalid.ZoneLink
+    dnsvalid.ZoneLink { zone: nm("example."),
+        dnskeys: [rec("example.", 48, 3600, v_ex_dnskey())],
+        dnskey_sigs: [sigrec("example.", v_ex_dnskey_sig())],
+        ds: [rec("example.", 43, 3600, v_ex_ds())],
+        ds_sigs: [sigrec("example.", v_ex_ds_sig())],
+        ds_absent: false }
+
+fn link_sub() -> dnsvalid.ZoneLink
+    dnsvalid.ZoneLink { zone: nm("sub.example."),
+        dnskeys: [rec("sub.example.", 48, 3600, v_sub_dnskey())],
+        dnskey_sigs: [sigrec("sub.example.", v_sub_dnskey_sig())],
+        ds: [rec("sub.example.", 43, 3600, v_sub_ds())],
+        ds_sigs: [sigrec("sub.example.", v_sub_ds_sig())],
+        ds_absent: false }
+
+fn chain() -> [dnsvalid.ZoneLink]
+    [link_root(), link_example(), link_sub()]
+
+// The answers.
+fn www_a() -> dnsrr.DnsRr
+    rec("www.sub.example.", 1, 300, v_www_a())
+
+fn www_sig() -> dnsrr.DnsRr
+    sigrec("www.sub.example.", v_www_a_sig())
+
+fn wild_txt() -> dnsrr.DnsRr
+    rec("a.b.sub.example.", 16, 300, v_wild_txt())
+
+fn wild_sig() -> dnsrr.DnsRr
+    sigrec("a.b.sub.example.", v_wild_txt_sig())
+
+fn mx_shown() -> dnsrr.DnsRr
+    rec("MX.Sub.EXAMPLE.", 15, 300, v_mx_shown())
+
+fn mx_sig() -> dnsrr.DnsRr
+    sigrec("mx.sub.example.", v_mx_sig())
+
+// ── The chain ───────────────────────────────────────────────────────
+
+@test
+fn test_a_chain_from_the_trust_anchor_is_secure_and_gives_the_zone_keys() [io]
+    let v = dnsvalid.validate_chain([anchor()], chain(), 1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_SECURE)
+    test.assert_eq(v.reason, dnsvalid.REASON_NONE)
+    test.assert_eq(dns_codec.name_text(v.zone), "sub.example.")
+    test.assert_eq(list.len(v.keys), 1)
+    test.assert_eq(v.keys[0].algorithm, 8)
+    test.assert_eq(dnskey.key_tag(dnskey.dnskey_rdata(v.keys[0])), 40727)
+    test.case("the root alone is secure too, with the root's keys")
+    let r = dnsvalid.validate_chain([anchor()], [link_root()], 1701000000)
+    test.assert_eq(r.state, dnsvalid.STATE_SECURE)
+    test.assert_eq(r.keys[0].algorithm, 15)
+    test.assert_eq(dnskey.key_tag(dnskey.dnskey_rdata(r.keys[0])), 36560)
+    test.case("and so is the chain down to example.")
+    test.assert_eq(dnsvalid.validate_chain([anchor()], [link_root(), link_example()], 1701000000).state,
+        dnsvalid.STATE_SECURE)
+
+@test
+fn test_answers_are_authenticated_through_the_chain() [io]
+    let now = 1701000000
+    test.case("www.sub.example. A")
+    let a = dnsvalid.validate_answer([anchor()], chain(), [www_a()], [www_sig()], now)
+    test.assert_eq(a.state, dnsvalid.STATE_SECURE)
+    test.assert_eq(a.reason, dnsvalid.REASON_NONE)
+    test.case("a wildcard expansion: the signature covers *.sub.example. and its Labels field is 2")
+    test.assert_eq(dnsvalid.validate_answer([anchor()], chain(), [wild_txt()], [wild_sig()], now).state,
+        dnsvalid.STATE_SECURE)
+    test.case("an MX whose owner and exchange have capital letters")
+    test.assert_eq(dnsvalid.validate_answer([anchor()], chain(), [mx_shown()], [mx_sig()], now).state,
+        dnsvalid.STATE_SECURE)
+    test.case("the keys of the zone check the RRset directly")
+    let keys = dnsvalid.validate_chain([anchor()], chain(), now).keys
+    test.assert_eq(dnsvalid.validate_rrset(keys, [www_a()], [www_sig()], now).state, dnsvalid.STATE_SECURE)
+
+@test
+fn test_the_validity_period_is_enforced_at_every_link_and_at_the_answer() [io]
+    test.case("one second before the inception and one after the expiration")
+    let early = dnsvalid.validate_answer([anchor()], chain(), [www_a()], [www_sig()], 1699999999)
+    test.assert_eq(early.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(early.detail, dnsrrsig.VERDICT_NOT_YET_VALID)
+    let late = dnsvalid.validate_answer([anchor()], chain(), [www_a()], [www_sig()], 1702592001)
+    test.assert_eq(late.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(late.detail, dnsrrsig.VERDICT_EXPIRED)
+    test.case("both ends are inside")
+    test.assert_eq(dnsvalid.validate_answer([anchor()], chain(), [www_a()], [www_sig()], 1700000000).state,
+        dnsvalid.STATE_SECURE)
+    test.assert_eq(dnsvalid.validate_answer([anchor()], chain(), [www_a()], [www_sig()], 1702592000).state,
+        dnsvalid.STATE_SECURE)
+
+@test
+fn test_a_changed_answer_is_bogus() [io]
+    let now = 1701000000
+    let changed = rec("www.sub.example.", 1, 300, "c0000202")
+    let v = dnsvalid.validate_answer([anchor()], chain(), [changed], [www_sig()], now)
+    test.assert_eq(v.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(v.reason, dnsvalid.REASON_SIGNATURE_FAILED)
+    test.assert_eq(v.detail, dnsrrsig.VERDICT_SIGNATURE)
+    test.case("no signature at all in a secure zone")
+    let none = dnsvalid.validate_answer([anchor()], chain(), [www_a()], [], now)
+    test.assert_eq(none.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(none.reason, dnsvalid.REASON_NO_SIGNATURE)
+    test.case("a signature over another type")
+    let other = dnsvalid.validate_answer([anchor()], chain(), [www_a()], [wild_sig()], now)
+    test.assert_eq(other.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(other.reason, dnsvalid.REASON_NO_SIGNATURE)
+    test.case("a signature of the right type for another name")
+    let moved = dnsvalid.validate_answer([anchor()], chain(), [rec("ftp.sub.example.", 1, 300, "c0000201")], [www_sig()], now)
+    test.assert_eq(moved.state, dnsvalid.STATE_BOGUS)
+
+@test
+fn test_a_signature_by_the_wrong_zone_is_bogus_and_an_answer_outside_it_is_indeterminate() [io]
+    let now = 1701000000
+    test.case("the answer's signer is example., but the chain ends at sub.example.")
+    let up = dnsvalid.validate_answer([anchor()], [link_root(), link_example()], [www_a()], [www_sig()], now)
+    test.assert_eq(up.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(up.reason, dnsvalid.REASON_WRONG_SIGNER)
+    test.case("an answer that is not under the zone the chain ends at")
+    let out = dnsvalid.validate_answer([anchor()], chain(), [rec("www.other.example.", 1, 300, "c0000201")], [www_sig()], now)
+    test.assert_eq(out.state, dnsvalid.STATE_INDETERMINATE)
+    test.assert_eq(out.reason, dnsvalid.REASON_NO_CHAIN)
+    test.case("an empty RRset")
+    test.assert_eq(dnsvalid.validate_answer([anchor()], chain(), [], [www_sig()], now).state,
+        dnsvalid.STATE_INDETERMINATE)
+    test.assert_eq(dnsvalid.validate_rrset([], [], [www_sig()], now).state, dnsvalid.STATE_INDETERMINATE)
+
+@test
+fn test_a_signature_made_with_an_algorithm_that_is_not_verified_is_indeterminate() [io]
+    let keys = dnsvalid.validate_chain([anchor()], chain(), 1701000000).keys
+    // The same RRSIG with its algorithm byte changed to 10 (RSA/SHA-512).
+    var rd = hexb(v_www_a_sig())
+    rd[2] = 10 as u8
+    let s = dnsrr.rr(nm("www.sub.example."), 46, 1, 3600, rd)
+    let v = dnsvalid.validate_rrset(keys, [www_a()], [s], 1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_INDETERMINATE)
+    test.assert_eq(v.reason, dnsvalid.REASON_ALGORITHM)
+    test.case("a signature with an unknown key tag is bogus, as the zone's keys are all known")
+    var rd2 = hexb(v_www_a_sig())
+    rd2[17] = (rd2[17] as Int ^ 1) as u8
+    let t = dnsrr.rr(nm("www.sub.example."), 46, 1, 3600, rd2)
+    let w = dnsvalid.validate_rrset(keys, [www_a()], [t], 1701000000)
+    test.assert_eq(w.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(w.reason, dnsvalid.REASON_SIGNATURE_FAILED)
+    test.assert_eq(w.detail, dnsrrsig.VERDICT_KEY_MISMATCH)
+    test.case("a malformed RRSIG record is ignored, and then there is no signature")
+    let junk = dnsrr.rr(nm("www.sub.example."), 46, 1, 3600, [0 as u8, 1 as u8, 2 as u8])
+    test.assert_eq(dnsvalid.validate_rrset(keys, [www_a()], [junk], 1701000000).reason,
+        dnsvalid.REASON_NO_SIGNATURE)
+
+// ── What breaks a chain ─────────────────────────────────────────────
+
+@test
+fn test_a_chain_with_no_anchor_or_no_link_is_indeterminate() [io]
+    let none = dnsvalid.validate_chain([], chain(), 1701000000)
+    test.assert_eq(none.state, dnsvalid.STATE_INDETERMINATE)
+    test.assert_eq(none.reason, dnsvalid.REASON_NO_ANCHOR)
+    let empty = dnsvalid.validate_chain([anchor()], [], 1701000000)
+    test.assert_eq(empty.state, dnsvalid.STATE_INDETERMINATE)
+    test.assert_eq(empty.reason, dnsvalid.REASON_NO_CHAIN)
+
+@test
+fn test_an_anchor_that_names_no_key_of_the_root_is_bogus() [io]
+    let wrong = dnskey.Ds { key_tag: anchor().key_tag,
+        algorithm: 15,
+        digest_type: 2,
+        digest: hexb("00".repeat(32)) }
+    let v = dnsvalid.validate_chain([wrong], chain(), 1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(v.reason, dnsvalid.REASON_NO_KEY_FOR_DS)
+    test.case("the real root anchor does not name the generated key either")
+    test.assert_eq(dnsvalid.validate_chain([dnsvalid.root_trust_anchor()], chain(), 1701000000).state,
+        dnsvalid.STATE_BOGUS)
+
+@test
+fn test_anchors_this_package_cannot_use_leave_the_zone_insecure() [io]
+    let bad_alg = dnskey.Ds { key_tag: 1, algorithm: 10, digest_type: 2, digest: hexb("00".repeat(32)) }
+    let gost = dnskey.Ds { key_tag: 1, algorithm: 8, digest_type: 3, digest: hexb("00".repeat(32)) }
+    test.assert_eq(dnsvalid.validate_chain([bad_alg], chain(), 1701000000).state, dnsvalid.STATE_INSECURE)
+    test.assert_eq(dnsvalid.validate_chain([gost], chain(), 1701000000).reason, dnsvalid.REASON_UNSUPPORTED)
+    test.case("one usable anchor among them is enough")
+    test.assert_eq(dnsvalid.validate_chain([bad_alg, anchor(), gost], chain(), 1701000000).state,
+        dnsvalid.STATE_SECURE)
+
+@test
+fn test_a_dnskey_rrset_that_the_ds_key_did_not_sign_is_bogus() [io]
+    test.case("no signature over the DNSKEY RRset")
+    var l0 = link_root()
+    l0 = dnsvalid.ZoneLink { zone: l0.zone,
+        dnskeys: l0.dnskeys,
+        dnskey_sigs: [],
+        ds: [],
+        ds_sigs: [],
+        ds_absent: false }
+    let a = dnsvalid.validate_chain([anchor()], [l0], 1701000000)
+    test.assert_eq(a.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(a.reason, dnsvalid.REASON_DNSKEY_NOT_SIGNED)
+    test.case("the root's signature on example.'s DNSKEY RRset")
+    let le = link_example()
+    let b = dnsvalid.validate_chain([anchor()], [link_root(), dnsvalid.ZoneLink { zone: le.zone,
+        dnskeys: le.dnskeys,
+        dnskey_sigs: [sigrec("example.", v_ex_ds_sig())],
+        ds: le.ds,
+        ds_sigs: le.ds_sigs,
+        ds_absent: false }],
+    1701000000)
+    test.assert_eq(b.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(b.reason, dnsvalid.REASON_DNSKEY_NOT_SIGNED)
+
+@test
+fn test_a_ds_rrset_the_parent_did_not_sign_is_bogus() [io]
+    let ls = link_sub()
+    test.case("the DS changed after it was signed")
+    let flipped = dnsrr.rr(nm("sub.example."), 43, 1, 3600, dnsrr.cat(hexb("0000"), list.slice(hexb(v_sub_ds()), 2, 36)))
+    let a = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: ls.dnskeys,
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: [flipped],
+        ds_sigs: ls.ds_sigs,
+        ds_absent: false }],
+    1701000000)
+    test.assert_eq(a.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(a.reason, dnsvalid.REASON_DS_NOT_SIGNED)
+    test.case("no signature over the DS")
+    let b = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: ls.dnskeys,
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: ls.ds,
+        ds_sigs: [],
+        ds_absent: false }],
+    1701000000)
+    test.assert_eq(b.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(b.reason, dnsvalid.REASON_DS_NOT_SIGNED)
+    test.case("the DS signed by the wrong zone's key: the example key signed it, the root's signature on it is another zone's")
+    let c = dnsvalid.validate_chain([anchor()], [link_root(), dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: ls.dnskeys,
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: ls.ds,
+        ds_sigs: ls.ds_sigs,
+        ds_absent: false }],
+    1701000000)
+    test.assert_eq(c.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(c.reason, dnsvalid.REASON_DS_NOT_SIGNED)
+
+@test
+fn test_a_dnskey_that_no_ds_names_is_bogus() [io]
+    let ls = link_sub()
+    // sub.example.'s links with example.'s DNSKEY in place of its own.
+    let swapped = dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: [rec("sub.example.", 48, 3600, v_ex_dnskey())],
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: ls.ds,
+        ds_sigs: ls.ds_sigs,
+        ds_absent: false }
+    let v = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), swapped], 1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(v.reason, dnsvalid.REASON_NO_KEY_FOR_DS)
+    test.case("a record in the DNSKEY RRset that is not a DNSKEY is not a key")
+    let notkey = dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: [rec("sub.example.", 16, 3600, "0161")],
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: ls.ds,
+        ds_sigs: ls.ds_sigs,
+        ds_absent: false }
+    test.assert_eq(dnsvalid.validate_chain([anchor()], [link_root(), link_example(), notkey], 1701000000).reason,
+        dnsvalid.REASON_NO_KEY_FOR_DS)
+    test.case("a DNSKEY record that does not parse is dropped")
+    let junk = dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: [rec("sub.example.", 48, 3600, "0101"), rec("sub.example.", 48, 3600, v_sub_dnskey())],
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: ls.ds,
+        ds_sigs: ls.ds_sigs,
+        ds_absent: false }
+    test.assert_eq(dnsvalid.validate_chain([anchor()], [link_root(), link_example(), junk], 1701000000).reason,
+        dnsvalid.REASON_DNSKEY_NOT_SIGNED)
+
+@test
+fn test_a_missing_ds_is_indeterminate_unless_its_absence_is_proved() [io]
+    let ls = link_sub()
+    let missing = dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: ls.dnskeys,
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: [],
+        ds_sigs: [],
+        ds_absent: false }
+    let v = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), missing], 1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_INDETERMINATE)
+    test.assert_eq(v.reason, dnsvalid.REASON_NO_DS)
+    test.case("a proof that there is no DS makes the zone insecure")
+    let absent = dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: [],
+        dnskey_sigs: [],
+        ds: [],
+        ds_sigs: [],
+        ds_absent: true }
+    let w = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), absent], 1701000000)
+    test.assert_eq(w.state, dnsvalid.STATE_INSECURE)
+    test.assert_eq(w.reason, dnsvalid.REASON_DS_ABSENT)
+    test.assert_eq(dns_codec.name_text(w.zone), "sub.example.")
+
+@test
+fn test_zones_out_of_order_are_bogus() [io]
+    let v = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), link_sub(), link_example()], 1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(v.reason, dnsvalid.REASON_OUT_OF_ORDER)
+    test.case("a zone that is not below the one before")
+    let other = dnsvalid.ZoneLink { zone: nm("other."),
+        dnskeys: [],
+        dnskey_sigs: [],
+        ds: [],
+        ds_sigs: [],
+        ds_absent: false }
+    test.assert_eq(dnsvalid.validate_chain([anchor()], [link_root(), link_example(), other], 1701000000).reason,
+        dnsvalid.REASON_OUT_OF_ORDER)
+    test.case("the same zone twice")
+    test.assert_eq(dnsvalid.validate_chain([anchor()], [link_root(), link_example(), link_example()], 1701000000).reason,
+        dnsvalid.REASON_OUT_OF_ORDER)
+
+// ── DS records this package cannot use (RFC 6840 section 5.2) ───────
+
+// A link for sub.example. whose DS RRset is `ds` with the signature `sig`.
+fn sub_with_ds(ds: [dnsrr.DnsRr], sig: dnsrr.DnsRr) -> dnsvalid.ZoneLink
+    let ls = link_sub()
+    dnsvalid.ZoneLink { zone: ls.zone,
+        dnskeys: ls.dnskeys,
+        dnskey_sigs: ls.dnskey_sigs,
+        ds: ds,
+        ds_sigs: [sig],
+        ds_absent: false }
+
+@test
+fn test_a_ds_of_an_unsupported_algorithm_or_digest_makes_the_zone_insecure() [io]
+    test.case("a DS that names algorithm 10")
+    let a = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), sub_with_ds([rec("sub.example.", 43, 3600, v_sub_ds_bad_alg())],
+        sigrec("sub.example.", v_sub_ds_bad_alg_sig()))],
+    1701000000)
+    test.assert_eq(a.state, dnsvalid.STATE_INSECURE)
+    test.assert_eq(a.reason, dnsvalid.REASON_UNSUPPORTED)
+    test.case("a DS whose digest type is 3, GOST, which is not computed")
+    let b = dnsvalid.validate_chain([anchor()], [link_root(),
+        link_example(),
+        sub_with_ds([rec("sub.example.", 43, 3600, v_sub_ds_gost())], sigrec("sub.example.", v_sub_ds_gost_sig()))],
+    1701000000)
+    test.assert_eq(b.state, dnsvalid.STATE_INSECURE)
+    test.case("an unsupported DS beside a supported one: the supported one is used")
+    let c = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), sub_with_ds([rec("sub.example.", 43, 3600, v_sub_ds()), rec("sub.example.", 43, 3600, v_sub_ds_bad_alg())],
+        sigrec("sub.example.", v_sub_ds_mixed_sig()))],
+    1701000000)
+    test.assert_eq(c.state, dnsvalid.STATE_SECURE)
+
+// ── Keys the package refuses ────────────────────────────────────────
+
+@test
+fn test_an_rsa_key_of_1024_bits_is_refused_and_the_signature_is_bogus() [io]
+    // short.example.'s 1024-bit RSA key, below the 2048 bits rsa-nv accepts.
+    let short_rd = hexb(v_short_dnskey())
+    match dnskey.dnskey_parse(short_rd)
+        Err(_) => test.assert_eq(true, false)
+        Ok(k)  =>
+            let sig = hexb(v_short_sig())
+            match dnsrrsig.rrsig_parse(sig)
+                Err(_) => test.assert_eq(true, false)
+                Ok(s)  =>
+                    let a = dnsrr.rr(nm("www.short.example."), 1, 1, 300, hexb("c0000201"))
+                    test.assert_eq(dnsrrsig.verify(k, s, [a], 1701000000), dnsrrsig.VERDICT_KEY_REFUSED)
+                    let v = dnsvalid.validate_rrset([k], [a], [dnsrr.rr(nm("www.short.example."), 46, 1, 3600, sig)], 1701000000)
+                    test.assert_eq(v.state, dnsvalid.STATE_BOGUS)
+                    test.assert_eq(v.detail, dnsrrsig.VERDICT_KEY_REFUSED)
+
+@test
+fn test_the_words_for_states_and_reasons() [io]
+    test.assert_eq(dnsvalid.state_name(0), "secure")
+    test.assert_eq(dnsvalid.state_name(1), "insecure")
+    test.assert_eq(dnsvalid.state_name(2), "bogus")
+    test.assert_eq(dnsvalid.state_name(3), "indeterminate")
+    test.assert_eq(dnsvalid.state_name(4), "unknown")
+    test.assert_eq(dnsvalid.reason_name(0), "authenticated")
+    test.assert_eq(dnsvalid.reason_name(1), "the chain does not reach the answer")
+    test.assert_eq(dnsvalid.reason_name(2), "a zone is not below the zone before it")
+    test.assert_eq(dnsvalid.reason_name(3), "no trust anchor was given")
+    test.assert_eq(dnsvalid.reason_name(4), "no DS record was supplied")
+    test.assert_eq(dnsvalid.reason_name(5), "the parent proved there is no DS record")
+    test.assert_eq(dnsvalid.reason_name(6), "no DS record names a supported algorithm and digest")
+    test.assert_eq(dnsvalid.reason_name(7), "the DS RRset is not signed by the parent")
+    test.assert_eq(dnsvalid.reason_name(8), "no DNSKEY is named by a DS record")
+    test.assert_eq(dnsvalid.reason_name(9), "the DNSKEY RRset is not signed by a key a DS record names")
+    test.assert_eq(dnsvalid.reason_name(10), "the RRset has no signature")
+    test.assert_eq(dnsvalid.reason_name(11), "no signature of the RRset verifies")
+    test.assert_eq(dnsvalid.reason_name(12), "the signatures use an algorithm that is not supported")
+    test.assert_eq(dnsvalid.reason_name(13), "the signer is not the zone the chain ends at")
+    test.assert_eq(dnsvalid.reason_name(99), "unknown")
+
+// ── Records the key set leaves out ──────────────────────────────────
+
+@test
+fn test_keys_without_the_zone_bit_revoked_keys_and_junk_are_not_in_the_key_set() [io]
+    // example.'s DNSKEY RRset holds its key and four records that are not
+    // usable: flags 1, flags 385 (zone key and revoked), protocol 4, and two
+    // bytes.  The whole RRset is signed by the example. key.
+    let le = link_example()
+    let extra = dnsvalid.ZoneLink { zone: le.zone, dnskeys: [rec("example.", 48, 3600, v_ex_dnskey()),
+        rec("example.", 48, 3600, v_ex_nz_dnskey()),
+        rec("example.", 48, 3600, v_ex_rv_dnskey()),
+        rec("example.", 48, 3600, v_ex_p4_dnskey()),
+        rec("example.", 48, 3600, v_ex_short_dnskey())],
+    dnskey_sigs: [sigrec("example.", v_ex_dnskey_extra_sig())], ds: le.ds, ds_sigs: le.ds_sigs, ds_absent: false }
+    let v = dnsvalid.validate_chain([anchor()], [link_root(), extra], 1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_SECURE)
+    test.assert_eq(list.len(v.keys), 1)
+    test.assert_eq(v.keys[0].flags, 257)
+
+@test
+fn test_a_ds_rrset_may_hold_a_record_that_is_not_a_ds() [io]
+    let v = dnsvalid.validate_chain([anchor()], [link_root(), link_example(), sub_with_ds([rec("sub.example.", 43, 3600, v_sub_ds()), rec("sub.example.", 43, 3600, v_sub_ds_junk())],
+        sigrec("sub.example.", v_sub_ds_junk_sig()))],
+    1701000000)
+    test.assert_eq(v.state, dnsvalid.STATE_SECURE)
+
+// ── The signed zones ────────────────────────────────────────────────
+
+// ── generated by tests/make_chain_vectors.py ──
+fn v_root_dnskey() -> Str
+    "0101030f79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910b" + "ad049664"
+
+fn v_root_anchor_ds() -> Str
+    "8ed00f0287c69552a404aa168a8eed61eaacee6e244dc2fcca0ac25a246390a0" + "f73bf1f2"
+
+fn v_root_dnskey_sig() -> Str
+    "00300f0000000e10657b7e006553f1008ed000d4e45658d670eb72aec10e8bb5" + "fab4da2c365e98139b0aa56513626431744fb21086138bb13d38ab2aec35bf99" + "77c830f8bd077f5a09cfa82dc9f9d55146db05"
+
+fn v_ex_ds() -> Str
+    "0dc00d0207db6809c3a9a2f7113a20ad65dc8feb832bdad8724feb7316c449b2" + "2ab9f2ed"
+
+fn v_ex_ds_sig() -> Str
+    "002b0f0100000e10657b7e006553f1008ed0002b5c12f9f64fa9d8c4e3262c51" + "1c84a8fea1769b214dfc52c64ab9208239c73109169e490ccc59f03bf4cf2de3" + "69216bde9f824220dd5a8447aa0ab99f46280e"
+
+fn v_ex_nz_dnskey() -> Str
+    "0001030d12750166f8c75f5bb653cf1f70a256c5980b5b34a746af7490764f40" + "7f154f41266fccb067f35107073a8616a7cae9be0a7dec535c66cfb54c1fd9cc" + "9b6ea992"
+
+fn v_ex_rv_dnskey() -> Str
+    "0181030d12750166f8c75f5bb653cf1f70a256c5980b5b34a746af7490764f40" + "7f154f41266fccb067f35107073a8616a7cae9be0a7dec535c66cfb54c1fd9cc" + "9b6ea992"
+
+fn v_ex_p4_dnskey() -> Str
+    "0101040d12750166f8c75f5bb653cf1f70a256c5980b5b34a746af7490764f40" + "7f154f41266fccb067f35107073a8616a7cae9be0a7dec535c66cfb54c1fd9cc" + "9b6ea992"
+
+fn v_ex_short_dnskey() -> Str
+    "0101"
+
+fn v_ex_dnskey_extra_sig() -> Str
+    "00300d0100000e10657b7e006553f1000dc0076578616d706c6500ff6f4b1e60" + "d4057a8e363339aeee73359147e80b1d85ee4531a9b7c8f7650da03fb660c363" + "a18e6fa714d5c08fc4e339f4d43209fe88ad8d3c6f186d116bf8db"
+
+fn v_ex_dnskey() -> Str
+    "0101030d12750166f8c75f5bb653cf1f70a256c5980b5b34a746af7490764f40" + "7f154f41266fccb067f35107073a8616a7cae9be0a7dec535c66cfb54c1fd9cc" + "9b6ea992"
+
+fn v_ex_dnskey_sig() -> Str
+    "00300d0100000e10657b7e006553f1000dc0076578616d706c6500a079a99cea" + "9ec79774af10effd0369419a13590005b1c05b81d4ffe046c8421a6f44d89852" + "04825d424e6c9901ac6ff62588ffe3ce5b806f23650a278414ecef"
+
+fn v_sub_ds() -> Str
+    "9f17080232c9fba23203c15208f7e2f542b6692a3b5646e49c749b2a8de5c63d" + "cbcf2180"
+
+fn v_sub_ds_sig() -> Str
+    "002b0d0200000e10657b7e006553f1000dc0076578616d706c650096094d35f9" + "f46b529030dd6644b0f57923c0978ea3f5e1fa93b379a8d54d9d6a93d5d584f7" + "90385449568fb12098de09b3e2fc248930c4c2ebac23a49b52252e"
+
+fn v_sub_ds_bad_alg() -> Str
+    "9f170a0232c9fba23203c15208f7e2f542b6692a3b5646e49c749b2a8de5c63d" + "cbcf2180"
+
+fn v_sub_ds_bad_alg_sig() -> Str
+    "002b0d0200000e10657b7e006553f1000dc0076578616d706c6500832e9bcd0b" + "04d8eac019c6a325148102028403f0c072c8f3ff873a572c05178fd4cff061e2" + "0858191b75be89427451f029860afc68f8dc0a44f9bb42c49a8a0b"
+
+fn v_sub_ds_gost() -> Str
+    "9f17080332c9fba23203c15208f7e2f542b6692a3b5646e49c749b2a8de5c63d" + "cbcf2180"
+
+fn v_sub_ds_gost_sig() -> Str
+    "002b0d0200000e10657b7e006553f1000dc0076578616d706c65005f9cc06a56" + "e314c73024f46cb2b283ef9760192292a0cdeb3e40c89a898b0f38ad35f8008c" + "29ac37f4cc45fc1f9465a99eb034a5cd7f879e7aeefd6b8549564e"
+
+fn v_sub_ds_mixed_sig() -> Str
+    "002b0d0200000e10657b7e006553f1000dc0076578616d706c65009f35080a03" + "d770630b0ef076422de7b2f302a597ae92b0a62c69c5deea6b2a7f4f59995672" + "5f9e9d6cbd4d804a237fa19c432e8f16bc0ebec7d3742730c4bf72"
+
+fn v_sub_ds_junk() -> Str
+    "00010203"
+
+fn v_sub_ds_junk_sig() -> Str
+    "002b0d0200000e10657b7e006553f1000dc0076578616d706c6500b3dc19fb6c" + "f84c767391f795aa8003f970b2753f38c7fc3d2f20cd282eae4b36dc501bb6b3" + "f0b0ef0344f7b6444923b7ee46b1256af7e7b6aa0201e15c5a9571"
+
+fn v_sub_dnskey() -> Str
+    "0101030803010001c4162822a82cbbeaa6854b4859361394d743ae6c3560bff4" + "63438cc3d284a92732c060d572e0cefd52e7bd5e1612ac1e71a6236f51f4a454" + "667c209891ffefb26a6a27ef9c7704692916ef7207d3d6c7678d0c81a504f935" + "8c09a01b12ce0dc4e1a188e132c187efcc7f5e3f7d055cfd04d5c113c725399c" + "61642b89205e16856cdfd36ae26f83a7a35999ac1865d53f5102b53537de6f71" + "d0a1351ed5662c10c5a7687798579a0603d42dbca135b7d19fb2a66e801776a2" + "2aace78ae7a093c55f4f307c172af0f49f7f0e0cef965b269126e2294d635340" + "1547f99263f1775365d9e61fa0cda1188fc0c7661050de92f8960c7f36576795" + "31e1f9559767855f"
+
+fn v_sub_dnskey_sig() -> Str
+    "0030080200000e10657b7e006553f1009f1703737562076578616d706c65007e" + "b457a10550ac4715169d3b244b94341b7461396399ec6393ba78ab26dbbf9dc3" + "77ed182b2c2c9e51de56cfdb5044e888952543f5377f86b035333470b6c1365a" + "13eac075935212758f96f5f65f72785873bac251b3e90be016c96b7c5a1471fa" + "bb7dd5342dda1c8f27468dafc9db3b5a86540e2f35ef5119283bf41e4bad4f00" + "465bd79d5f7022dd2e269f443f921677758d26bdb5ea2c2c97f2fb1d7cc38acb" + "9a7bb2654b8bd42faed5b40c58c6b7e20a84c23252921bdf9eec900b8d3fdd71" + "dc6496969588a18f0fcb691b935aa7ed43ac4d63c413dce1c49cfd98955eee47" + "1aa55b86fb755e6a4004dd437e03fc2b5365ab5ec2cc66a924803bd882753f"
+
+fn v_www_a() -> Str
+    "c0000201"
+
+fn v_www_a_sig() -> Str
+    "000108030000012c657b7e006553f1009f1703737562076578616d706c650070" + "a075b690fd35738980e2b5abcfecfcb563cec3968316ebe68ff098f142541fda" + "721d82f1e37e7470f6dd1c7e0f7559f492b5db06182f91b600e3debbbfe36b3e" + "5fb7f5468c5fb61de56caed0bf8a4aa6401e7b8fcc85fca4f725eb238204a364" + "2332639959b579372d3ac90bc15963ffab5813f280f3d989e33b126588c0988b" + "6661068541fa0c37a637744970206f36c121b5e144ba3e8936402628e3285af7" + "caabe5141740d58ffef89f7761c28f3841cf64a7bd361b1ff7913f5b82cb6c6d" + "62edc962e2ede7ae9699ba155998c20c94c1fc4db8e5dbcccd4377653b74802a" + "1d1ad92b06b33cbe3d3904919e441c45b0363d4105f5548e341a7cf49ac518"
+
+fn v_wild_txt() -> Str
+    "0477696c64"
+
+fn v_wild_txt_sig() -> Str
+    "001008020000012c657b7e006553f1009f1703737562076578616d706c650030" + "64d169a6e7cd7b0eb69aa45307f83a5f17821d9093997c20ae290fb152239df1" + "b92990e5ec739eeed0a6e0fb7a8afa89fd993718a9e623e5e07833bb042ec2b4" + "5602934f7f79d5354ebdb29c410321cd0d03e7f5398b164de873e242ba6d2e9f" + "69de6a403634bd7353e6d0657203f2f4016a28b5fa22d302d8e3f535133d2fce" + "ca1cd69aaff3ea1eed38f0cb88c85c30f2b101c2db154b3a3b8e596110988119" + "093b0edf2f5051296d909868485304471d82c073eab4fb87379eda120c1a7deb" + "bcea205c303f74ea52a26118f23092585c87a1986c264703a3ccf11efc32696f" + "7d4e8f6a5d5e096d65148ca959f319d379078fd5cb8124c7986d660985fbd0"
+
+fn v_mx_shown() -> Str
+    "000a044d61696c03535542076578616d706c6500"
+
+fn v_mx_sig() -> Str
+    "000f08030000012c657b7e006553f1009f1703737562076578616d706c65000c" + "287b72d2f94b6797727cd7eb1e0a00c7835ac434feb7b3aa45a0b5953029543d" + "8fa20646a1925ca516ae06b57197b3607b1ca99636f1b097efe1f38607e9616a" + "f9e533aa9ca72adab6e72d4d7183a2dbc5fef8d2c8d1bb825fcd95eef4daea0e" + "8ac62266b1945d081e97e5441e4c59cb376f1e7437761550cdbdfb871b42fb6e" + "4a1aa352c76935416fa929bd31ef350eeedc5d7e9e0f08afaf3d0ff4b31a31fa" + "1ac302af4c1de8025726fbcdb58242b9e9c565935ebb61a99617dda85db58504" + "6be0b3a1c5439c4638cdf4d83e3750840b0839fb397f9d5ed7491add46ee8162" + "94df1a9ca9f271e254e1375604989f25014277c8eccd7759195449a870f1dd"
+
+fn v_short_dnskey() -> Str
+    "0101030803010001f38cba59541d1174f536a3b7a3abc45ef697cd13ac7f6a11" + "773a256be6c3baa99f981fc40875f4503a0faa5d6c1015268a8aa9bf55339402" + "018fafe4806299241183dbf6fcc40f18d6a857ea5373ac938b26acc93795feb9" + "942d0ee51bd8632d5ed6c1645ef78306e304083ecd30eba187d09abc80b72b8e" + "edde3ab2bf585411"
+
+fn v_short_sig() -> Str
+    "000108030000012c657b7e006553f100a7720573686f7274076578616d706c65" + "004fe9c73cb8178c0f2b9ae8ec053b1131b27f995100a40e2da689dcf3d667de" + "28aabd47b1dd893f9e3265746f5ab6bd8508d155fa34281dd7b318e09afa805c" + "c10bdf416b81118d17488b89d4fe189c2a786d8c540422f2387ea2c68e7d30fe" + "ac1d8002fc6d34d21b5f47abd753eeb8fe9ec53b8db1ec90b808a0d950ea44ee" + "b0"
+
+// ── Signer and entry keys ───────────────────────────────────────────
+
+// An A record at www.example. signed by the example. key with the signer
+// name ".", made by tests/make_chain_vectors.py.  The key tag and the
+// algorithm are the example. key's, so the signature verifies against it.
+fn v_ex_www_a_root_signer_sig() -> Str
+    "00010d020000012c657b7e006553f1000dc0004bae1285aeee1c8d038838f849" + "cfd2951d9bdfdebbef689bd584bb3e4f629e7415ff81a3598d3a289e4aa15afe" + "a25d944d99d96970b617fe67b99548a6b42b47"
+
+@test
+fn test_a_signature_that_verifies_but_names_another_signer_is_bogus() [io]
+    let now = 1701000000
+    let www = rec("www.example.", 1, 300, "c0000201")
+    let sig = sigrec("www.example.", v_ex_www_a_root_signer_sig())
+    test.case("the signature itself is good: the example. key checks it")
+    let keys = dnsvalid.validate_chain([anchor()], [link_root(), link_example()], now).keys
+    test.assert_eq(dnsvalid.validate_rrset(keys, [www], [sig], now).state, dnsvalid.STATE_SECURE)
+    test.case("but its signer is the root, and the chain ends at example.")
+    let v = dnsvalid.validate_answer([anchor()], [link_root(), link_example()], [www], [sig], now)
+    test.assert_eq(v.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(v.reason, dnsvalid.REASON_WRONG_SIGNER)
+
+@test
+fn test_a_ds_that_names_a_revoked_key_or_one_without_the_zone_bit_names_no_key() [io]
+    let now = 1701000000
+    test.case("a revoked key")
+    let revoked = hexb(v_ex_rv_dnskey())
+    let link_rv = dnsvalid.ZoneLink { zone: nm("example."),
+        dnskeys: [rec("example.", 48, 3600, v_ex_rv_dnskey())],
+        dnskey_sigs: [],
+        ds: [],
+        ds_sigs: [],
+        ds_absent: false }
+    let v1 = dnsvalid.validate_chain([dnskey.ds_of_dnskey(nm("example."), revoked, 2)], [link_rv], now)
+    test.assert_eq(v1.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(v1.reason, dnsvalid.REASON_NO_KEY_FOR_DS)
+    test.case("a key without the zone bit")
+    let plain = hexb(v_ex_nz_dnskey())
+    let link_nz = dnsvalid.ZoneLink { zone: nm("example."),
+        dnskeys: [rec("example.", 48, 3600, v_ex_nz_dnskey())],
+        dnskey_sigs: [],
+        ds: [],
+        ds_sigs: [],
+        ds_absent: false }
+    let v2 = dnsvalid.validate_chain([dnskey.ds_of_dnskey(nm("example."), plain, 2)], [link_nz], now)
+    test.assert_eq(v2.state, dnsvalid.STATE_BOGUS)
+    test.assert_eq(v2.reason, dnsvalid.REASON_NO_KEY_FOR_DS)

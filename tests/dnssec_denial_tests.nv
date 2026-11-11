@@ -1,0 +1,538 @@
+// dnssec_denial_tests.nv — authenticated denial of existence: the NSEC
+// chain of RFC 4035 appendix A with the responses of appendix B, and the
+// NSEC3 zone of RFC 5155 appendix A with its example responses of appendix
+// B, including the hashes of the owner names, which the RFC lists as test
+// vectors for the hash algorithm.
+//
+// The records are the RFCs' own, written here as owner, next name and
+// types.  Their signatures are not checked here: the proofs read records
+// that `dnsvalid.validate_rrset` has already authenticated.
+
+use std.test
+use std.bytes
+use std.str
+use dns_codec
+use dnsrr
+use dnskey
+use dnsnsec
+
+// The bytes of hexadecimal text.
+fn hexb(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(text) ?? bytes.zeros(0))
+
+// A name from presentation text.
+fn nm(text: Str) -> dns_codec.DnsName
+    dnsrr.name_text(text)
+
+// The hexadecimal text of bytes.
+fn hx(b: [u8]) -> Str
+    bytes.to_hex(bytes.from_byte_list(b))
+
+// The base32hex text of the NSEC3 hash of a name in the zone of RFC 5155
+// appendix A: SHA-1, 12 additional iterations, the salt aabbccdd.
+fn h(name: Str) -> Str
+    dnsnsec.base32hex_encode(dnsnsec.nsec3_hash(nm(name), 12, hexb("aabbccdd")))
+
+// ── The hashes (RFC 5155 appendix A) ────────────────────────────────
+
+@test
+fn test_the_hashes_of_the_appendix_a_names_are_the_ones_the_rfc_lists() [io]
+    test.assert_eq(h("example."), "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom")
+    test.assert_eq(h("a.example."), "35mthgpgcu1qg68fab165klnsnk3dpvl")
+    test.assert_eq(h("ai.example."), "gjeqe526plbf1g8mklp59enfd789njgi")
+    test.assert_eq(h("ns1.example."), "2t7b4g4vsa5smi47k61mv5bv1a22bojr")
+    test.assert_eq(h("ns2.example."), "q04jkcevqvmu85r014c7dkba38o0ji5r")
+    test.assert_eq(h("w.example."), "k8udemvp1j2f7eg6jebps17vp3n8i58h")
+    test.assert_eq(h("*.w.example."), "r53bq7cc2uvmubfu5ocmm6pers9tk9en")
+    test.assert_eq(h("x.w.example."), "b4um86eghhds6nea196smvmlo4ors995")
+    test.assert_eq(h("y.w.example."), "ji6neoaepv8b5o6k4ev33abha8ht9fgc")
+    test.assert_eq(h("x.y.w.example."), "2vptu5timamqttgl4luu9kg21e0aor3s")
+    test.assert_eq(h("xx.example."), "t644ebqk9bibcna874givr6joj62mlhv")
+    test.assert_eq(h("2t7b4g4vsa5smi47k61mv5bv1a22bojr.example."), "kohar7mbb8dc2ce8a9qvl8hon4k53uhi")
+    test.case("the hashes of appendix B")
+    test.assert_eq(h("c.x.w.example."), "0va5bpr2ou0vk0lbqeeljri88laipsfh")
+    test.assert_eq(h("*.x.w.example."), "92pqneegtaue7pjatc3l3qnk738c6v5m")
+    test.assert_eq(h("z.w.example."), "qlu7gtfaeh0ek0c05ksfhdpbcgglbe03")
+    test.assert_eq(h("c.example."), "4g6p9u5gvfshp30pqecj98b3maqbn1ck")
+    test.case("the name is folded to lower case, and the iteration count and the salt matter")
+    test.assert_eq(h("A.EXAMPLE."), "35mthgpgcu1qg68fab165klnsnk3dpvl")
+    test.assert_eq(dnsnsec.base32hex_encode(dnsnsec.nsec3_hash(nm("example."), 0, [])),
+        dnsnsec.base32hex_encode(dnsnsec.nsec3_hash(nm("example."), 0, [])))
+    test.assert_eq(dnsnsec.base32hex_encode(dnsnsec.nsec3_hash(nm("example."), 11, hexb("aabbccdd"))) == h("example."),
+        false)
+    test.assert_eq(dnsnsec.base32hex_encode(dnsnsec.nsec3_hash(nm("example."), 12, hexb("aabbccde"))) == h("example."),
+        false)
+    test.assert_eq(list.len(dnsnsec.nsec3_hash(nm("example."), 0, [])), 20)
+
+// Whether base32hex text is refused.
+fn b32_refused(text: Str) -> Bool
+    match dnsnsec.base32hex_decode(text)
+        Some(_) => false
+        None    => true
+
+@test
+fn test_base32hex_follows_rfc_4648_section_10() [io]
+    test.assert_eq(dnsnsec.base32hex_encode([]), "")
+    test.assert_eq(dnsnsec.base32hex_encode(hexb("66")), "co")
+    test.assert_eq(dnsnsec.base32hex_encode(hexb("666f")), "cpng")
+    test.assert_eq(dnsnsec.base32hex_encode(hexb("666f6f")), "cpnmu")
+    test.assert_eq(dnsnsec.base32hex_encode(hexb("666f6f62")), "cpnmuog")
+    test.assert_eq(dnsnsec.base32hex_encode(hexb("666f6f6261")), "cpnmuoj1")
+    test.assert_eq(dnsnsec.base32hex_encode(hexb("666f6f626172")), "cpnmuoj1e8")
+    test.case("decoding, either case, and the inverse")
+    match dnsnsec.base32hex_decode("CPNMUOJ1E8")
+        Some(b) => test.assert_eq(hx(b), "666f6f626172")
+        None    => test.assert_eq(true, false)
+    match dnsnsec.base32hex_decode("cpnmuoj1e8")
+        Some(b) => test.assert_eq(hx(b), "666f6f626172")
+        None    => test.assert_eq(true, false)
+    match dnsnsec.base32hex_decode("")
+        Some(b) => test.assert_eq(list.len(b), 0)
+        None    => test.assert_eq(true, false)
+    match dnsnsec.base32hex_decode(h("example."))
+        Some(b) => test.assert_eq(list.len(b), 20)
+        None    => test.assert_eq(true, false)
+    test.case("a character outside 0-9 and a-v, and bits left over that are not zero")
+    test.assert_eq(b32_refused("cpnw"), true)
+    test.assert_eq(b32_refused("c!"), true)
+    test.assert_eq(b32_refused("cp"), true)
+    test.assert_eq(b32_refused("co"), false)
+
+// ── NSEC3 records ───────────────────────────────────────────────────
+
+// One NSEC3 record of the zone of appendix A: the base32hex hash of its
+// owner, its Opt-Out flag, the base32hex hash of the next name and its
+// types.
+fn n3(owner: Str, next: Str, types: [Int]) -> dnsnsec.Nsec3Rr
+    dnsnsec.Nsec3Rr { owner_hash: b32(owner), zone: nm("example."), rec: dnsnsec.Nsec3 { algorithm: 1,
+        flags: 1,
+        iterations: 12,
+        salt: hexb("aabbccdd"),
+        next_hash: b32(next),
+        bitmap: dnsnsec.bitmap_encode(types) } }
+
+// The bytes of base32hex text known to be good.
+fn b32(text: Str) -> [u8]
+    match dnsnsec.base32hex_decode(text)
+        Some(b) => b
+        None    => []
+
+// The records of appendix A, in the order of their owners' hashes.
+fn z_example() -> dnsnsec.Nsec3Rr
+    n3("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", "2t7b4g4vsa5smi47k61mv5bv1a22bojr", [15, 48, 2, 6, 51, 46])
+fn z_ns1() -> dnsnsec.Nsec3Rr
+    n3("2t7b4g4vsa5smi47k61mv5bv1a22bojr", "2vptu5timamqttgl4luu9kg21e0aor3s", [1, 46])
+fn z_xyw() -> dnsnsec.Nsec3Rr
+    n3("2vptu5timamqttgl4luu9kg21e0aor3s", "35mthgpgcu1qg68fab165klnsnk3dpvl", [15, 46])
+fn z_a() -> dnsnsec.Nsec3Rr
+    n3("35mthgpgcu1qg68fab165klnsnk3dpvl", "b4um86eghhds6nea196smvmlo4ors995", [2, 43, 46])
+fn z_xw() -> dnsnsec.Nsec3Rr
+    n3("b4um86eghhds6nea196smvmlo4ors995", "gjeqe526plbf1g8mklp59enfd789njgi", [15, 46])
+fn z_ai() -> dnsnsec.Nsec3Rr
+    n3("gjeqe526plbf1g8mklp59enfd789njgi", "ji6neoaepv8b5o6k4ev33abha8ht9fgc", [13, 1, 28, 46])
+fn z_yw() -> dnsnsec.Nsec3Rr
+    n3("ji6neoaepv8b5o6k4ev33abha8ht9fgc", "k8udemvp1j2f7eg6jebps17vp3n8i58h", [])
+fn z_w() -> dnsnsec.Nsec3Rr
+    n3("k8udemvp1j2f7eg6jebps17vp3n8i58h", "kohar7mbb8dc2ce8a9qvl8hon4k53uhi", [])
+fn z_hash() -> dnsnsec.Nsec3Rr
+    n3("kohar7mbb8dc2ce8a9qvl8hon4k53uhi", "q04jkcevqvmu85r014c7dkba38o0ji5r", [1, 46])
+fn z_ns2() -> dnsnsec.Nsec3Rr
+    n3("q04jkcevqvmu85r014c7dkba38o0ji5r", "r53bq7cc2uvmubfu5ocmm6pers9tk9en", [1, 46])
+fn z_star_w() -> dnsnsec.Nsec3Rr
+    n3("r53bq7cc2uvmubfu5ocmm6pers9tk9en", "t644ebqk9bibcna874givr6joj62mlhv", [15, 46])
+fn z_xx() -> dnsnsec.Nsec3Rr
+    n3("t644ebqk9bibcna874givr6joj62mlhv", "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", [13, 1, 28, 46])
+
+@test
+fn test_an_nsec3_record_is_read_and_written_back() [io]
+    // 0p9mhaveqvm6t7vbl5lop2u3t2rp3tom.example. NSEC3 1 1 12 aabbccdd
+    //   (2t7b4g4vsa5smi47k61mv5bv1a22bojr MX DNSKEY NS SOA NSEC3PARAM RRSIG)
+    let rec = z_example().rec
+    let rd = dnsnsec.nsec3_rdata(rec)
+    test.assert_eq(hx(list.slice(rd, 0, 9)), "010100" + "0c" + "04" + "aabbccdd")
+    match dnsnsec.nsec3_parse(rd)
+        Err(_) => test.assert_eq(true, false)
+        Ok(p)  =>
+            test.assert_eq(p.algorithm, 1)
+            test.assert_eq(p.flags, 1)
+            test.assert_eq(p.iterations, 12)
+            test.assert_eq(hx(p.salt), "aabbccdd")
+            test.assert_eq(dnsnsec.base32hex_encode(p.next_hash), "2t7b4g4vsa5smi47k61mv5bv1a22bojr")
+            test.assert_eq(dnsnsec.bitmap_has(p.bitmap, 15), true)
+            test.assert_eq(dnsnsec.bitmap_has(p.bitmap, 51), true)
+            test.assert_eq(dnsnsec.bitmap_has(p.bitmap, 1), false)
+            test.assert_eq(hx(dnsnsec.nsec3_rdata(p)), hx(rd))
+
+@test
+fn test_an_nsec3_record_is_made_from_a_resource_record() [io]
+    let owner = nm(h("example.") + ".example.")
+    let r = dnsrr.rr(owner, 50, 1, 3600, dnsnsec.nsec3_rdata(z_example().rec))
+    match dnsnsec.nsec3_rr(r)
+        Err(_) => test.assert_eq(true, false)
+        Ok(n)  =>
+            test.assert_eq(dnsnsec.base32hex_encode(n.owner_hash), "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom")
+            test.assert_eq(dns_codec.name_text(n.zone), "example.")
+    test.case("an owner whose first label is not base32hex, or an empty name, is refused")
+    match dnsnsec.nsec3_rr(dnsrr.rr(nm("zz!.example."), 50, 1, 1, dnsnsec.nsec3_rdata(z_example().rec)))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: a name in the RDATA is compressed or has no end")
+    match dnsnsec.nsec3_rr(dnsrr.rr(nm("."), 50, 1, 1, dnsnsec.nsec3_rdata(z_example().rec)))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(_) => test.assert_eq(true, true)
+    test.case("an RDATA that is not an NSEC3 is refused")
+    match dnsnsec.nsec3_rr(dnsrr.rr(owner, 50, 1, 1, [1 as u8, 2 as u8]))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the RDATA is 2 bytes, and the record needs 6")
+
+@test
+fn test_malformed_nsec3_rdata_is_refused_with_the_reason() [io]
+    test.case("a salt longer than the RDATA")
+    match dnsnsec.nsec3_parse(hexb("010100" + "0c" + "20" + "aabb"))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the NSEC3 record is malformed")
+    test.case("a hash length of zero, and a hash that runs past the end")
+    match dnsnsec.nsec3_parse(hexb("010100" + "0c" + "00" + "00"))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the NSEC3 record is malformed")
+    match dnsnsec.nsec3_parse(hexb("010100" + "0c" + "00" + "14" + "aabb"))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the NSEC3 record is malformed")
+    test.case("a bitmap that is malformed")
+    match dnsnsec.nsec3_parse(hexb("010100" + "0c" + "00" + "01" + "aa" + "0000"))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the type bitmap is malformed")
+    test.case("no salt, and a short hash, is fine")
+    match dnsnsec.nsec3_parse(hexb("010100" + "0c" + "00" + "01" + "aa"))
+        Ok(p)  =>
+            test.assert_eq(list.len(p.salt), 0)
+            test.assert_eq(list.len(p.next_hash), 1)
+        Err(_) => test.assert_eq(true, false)
+
+@test
+fn test_nsec3param_is_read() [io]
+    // example. NSEC3PARAM 1 0 12 aabbccdd
+    match dnsnsec.nsec3param_parse(hexb("010000" + "0c" + "04" + "aabbccdd"))
+        Err(_) => test.assert_eq(true, false)
+        Ok(p)  =>
+            test.assert_eq(p.algorithm, 1)
+            test.assert_eq(p.flags, 0)
+            test.assert_eq(p.iterations, 12)
+            test.assert_eq(hx(p.salt), "aabbccdd")
+    match dnsnsec.nsec3param_parse(hexb("0100" + "00"))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the RDATA is 3 bytes, and the record needs 5")
+    match dnsnsec.nsec3param_parse(hexb("010000" + "0c" + "04" + "aabb"))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the NSEC3 record is malformed")
+
+// ── The proofs of RFC 5155 appendix B ───────────────────────────────
+
+@test
+fn test_b1_a_name_error_is_proved_by_the_closest_encloser_and_two_covers() [io]
+    // a.c.x.w.example. A: the NSEC3 that matches x.w.example (the closest
+    // encloser), the one that covers c.x.w.example (the next closer name)
+    // and the one that covers *.x.w.example.
+    let set = [z_example(), z_xw(), z_a()]
+    test.assert_eq(dnsnsec.nsec3_denial(set, nm("example."), nm("a.c.x.w.example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+    test.case("the case of the name does not matter")
+    test.assert_eq(dnsnsec.nsec3_denial(set, nm("EXAMPLE."), nm("A.C.X.W.Example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+    test.case("without the cover of the wildcard, or of the next closer name, nothing is proved")
+    test.assert_eq(dnsnsec.nsec3_denial([z_example(), z_xw()], nm("example."), nm("a.c.x.w.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.assert_eq(dnsnsec.nsec3_denial([z_xw(), z_a()], nm("example."), nm("a.c.x.w.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.case("without the record that matches the closest encloser")
+    test.assert_eq(dnsnsec.nsec3_denial([z_example(), z_a()], nm("example."), nm("a.c.x.w.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_b2_no_data_is_proved_by_the_matching_record() [io]
+    test.case("ns1.example. MX: the record matches and lacks MX and CNAME")
+    test.assert_eq(dnsnsec.nsec3_denial([z_ns1()], nm("example."), nm("ns1.example."), 15), dnsnsec.DENIAL_NODATA)
+    test.case("ns1.example. A: the type is there, so nothing is proved")
+    test.assert_eq(dnsnsec.nsec3_denial([z_ns1()], nm("example."), nm("ns1.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.case("a record with CNAME proves no data for no other type")
+    let cname = n3("2t7b4g4vsa5smi47k61mv5bv1a22bojr", "2vptu5timamqttgl4luu9kg21e0aor3s", [5, 46])
+    test.assert_eq(dnsnsec.nsec3_denial([cname], nm("example."), nm("ns1.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+    test.case("B.2.1: y.w.example. is an empty non-terminal, with an empty bitmap")
+    test.assert_eq(dnsnsec.nsec3_denial([z_yw()], nm("example."), nm("y.w.example."), 1), dnsnsec.DENIAL_NODATA)
+
+@test
+fn test_b3_an_opt_out_delegation_has_no_ds() [io]
+    // The delegation c.example., which is not signed, proved by the record
+    // that matches the closest encloser example. and the one that covers
+    // the next closer name c.example., which has the Opt-Out flag.
+    test.assert_eq(dnsnsec.nsec3_denial([z_a(), z_example()], nm("example."), nm("c.example."), 43),
+        dnsnsec.DENIAL_OPT_OUT)
+    test.case("the same records prove nothing about an ordinary type, as a name error needs the wildcard cover")
+    test.assert_eq(dnsnsec.nsec3_denial([z_a(), z_example()], nm("example."), nm("c.example."), 15),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.case("with the wildcard covered, the name error stands whatever the Opt-Out flag says")
+    test.assert_eq(dnsnsec.nsec3_denial([z_a(), z_example(), z_ai()], nm("example."), nm("c.example."), 15),
+        dnsnsec.DENIAL_NXDOMAIN)
+
+@test
+fn test_a_delegation_with_a_matching_record_has_no_ds_when_ns_is_set_and_ds_is_not() [io]
+    let unsigned = n3("35mthgpgcu1qg68fab165klnsnk3dpvl", "b4um86eghhds6nea196smvmlo4ors995", [2, 46])
+    test.assert_eq(dnsnsec.nsec3_denial([unsigned], nm("example."), nm("a.example."), 43), dnsnsec.DENIAL_NO_DS)
+    test.case("a.example. in the zone of appendix A has a DS, so no absence is proved")
+    test.assert_eq(dnsnsec.nsec3_denial([z_a()], nm("example."), nm("a.example."), 43), dnsnsec.DENIAL_NO_PROOF)
+    test.case("a name that is not a delegation: no data for DS")
+    test.assert_eq(dnsnsec.nsec3_denial([z_ai()], nm("example."), nm("ai.example."), 43), dnsnsec.DENIAL_NODATA)
+
+@test
+fn test_b4_a_wildcard_expansion_needs_the_next_closer_name_covered() [io]
+    // a.z.w.example. MX answered from *.w.example.: the RRSIG Labels field is
+    // 2, so the next closer name is z.w.example., which q04jkcev... covers.
+    test.assert_eq(dnsnsec.nsec3_wildcard_expansion_ok([z_ns2()], nm("a.z.w.example."), 2), true)
+    test.assert_eq(dnsnsec.nsec3_wildcard_expansion_ok([z_example()], nm("a.z.w.example."), 2), false)
+    test.assert_eq(dnsnsec.nsec3_wildcard_expansion_ok([], nm("a.z.w.example."), 2), false)
+    test.case("a Labels field that is not smaller than the owner's label count is no expansion")
+    test.assert_eq(dnsnsec.nsec3_wildcard_expansion_ok([z_ns2()], nm("a.z.w.example."), 4), false)
+    test.assert_eq(dnsnsec.nsec3_wildcard_expansion_ok([z_ns2()], nm("a.z.w.example."), 5), false)
+
+@test
+fn test_b5_a_wildcard_with_no_data_is_proved() [io]
+    // a.z.w.example. AAAA: w.example. matches (the closest encloser), the next
+    // closer name z.w.example. is covered, and *.w.example. matches and lacks
+    // AAAA.
+    let set = [z_w(), z_ns2(), z_star_w()]
+    test.assert_eq(dnsnsec.nsec3_denial(set, nm("example."), nm("a.z.w.example."), 28),
+        dnsnsec.DENIAL_NODATA_WILDCARD)
+    test.case("the wildcard has MX, so a query for MX is not a no-data")
+    test.assert_eq(dnsnsec.nsec3_denial(set, nm("example."), nm("a.z.w.example."), 15), dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_b6_an_apex_record_cannot_prove_the_absence_of_a_ds() [io]
+    // example. DS asked of the child's servers: the record matches, has the
+    // SOA bit, and so comes from the child's apex and not the parent's cut.
+    test.assert_eq(dnsnsec.nsec3_denial([z_example()], nm("example."), nm("example."), 43),
+        dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_a_closest_encloser_that_is_a_delegation_cannot_deny_what_is_below_it() [io]
+    // a.example. has NS and no SOA; a name below it cannot be proved absent
+    // by its NSEC3 (section 8.3): an attacker could replay the delegation's
+    // records.
+    let set = [z_a(), z_ns1(), z_xyw()]
+    test.assert_eq(dnsnsec.nsec3_denial(set, nm("example."), nm("www.a.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_nsec3_records_with_different_parameters_prove_nothing() [io]
+    let other = dnsnsec.Nsec3Rr { owner_hash: z_xw().owner_hash, zone: nm("example."), rec: dnsnsec.Nsec3 { algorithm: 1,
+        flags: 1,
+        iterations: 5,
+        salt: hexb("aabbccdd"),
+        next_hash: z_xw().rec.next_hash,
+        bitmap: z_xw().rec.bitmap } }
+    test.assert_eq(dnsnsec.nsec3_denial([z_example(), other, z_a()], nm("example."), nm("a.c.x.w.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    let salt2 = dnsnsec.Nsec3Rr { owner_hash: z_xw().owner_hash, zone: nm("example."), rec: dnsnsec.Nsec3 { algorithm: 1,
+        flags: 1,
+        iterations: 12,
+        salt: hexb("aabbccde"),
+        next_hash: z_xw().rec.next_hash,
+        bitmap: z_xw().rec.bitmap } }
+    test.assert_eq(dnsnsec.nsec3_denial([z_example(), salt2, z_a()], nm("example."), nm("a.c.x.w.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    let alg2 = dnsnsec.Nsec3Rr { owner_hash: z_xw().owner_hash, zone: nm("example."), rec: dnsnsec.Nsec3 { algorithm: 2,
+        flags: 1,
+        iterations: 12,
+        salt: hexb("aabbccdd"),
+        next_hash: z_xw().rec.next_hash,
+        bitmap: z_xw().rec.bitmap } }
+    test.assert_eq(dnsnsec.nsec3_denial([alg2], nm("example."), nm("x.w.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+    let elsewhere = dnsnsec.Nsec3Rr { owner_hash: z_xw().owner_hash, zone: nm("other."), rec: z_xw().rec }
+    test.assert_eq(dnsnsec.nsec3_denial([z_example(), elsewhere, z_a()], nm("example."), nm("a.c.x.w.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.case("a name outside the zone, and an empty set")
+    test.assert_eq(dnsnsec.nsec3_denial([z_example()], nm("example."), nm("www.other."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.assert_eq(dnsnsec.nsec3_denial([], nm("example."), nm("www.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_the_nsec3_cover_wraps_at_the_end_of_the_chain() [io]
+    // xx.example. (t644...) is the last record: its next hash is the first
+    // owner's (0p9m...).  A hash after t644... or before 0p9m... is covered.
+    let last = z_xx()
+    test.assert_eq(dnsnsec.nsec3_covers(last, b32("v000000000000000000000000000000f")), true)
+    test.assert_eq(dnsnsec.nsec3_covers(last, b32("00000000000000000000000000000000")), true)
+    test.assert_eq(dnsnsec.nsec3_covers(last, b32("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom")), false)
+    test.assert_eq(dnsnsec.nsec3_covers(last, b32("t644ebqk9bibcna874givr6joj62mlhv")), false)
+    test.assert_eq(dnsnsec.nsec3_covers(last, b32("k8udemvp1j2f7eg6jebps17vp3n8i58h")), false)
+    test.assert_eq(dnsnsec.nsec3_covers(z_ns2(), b32("qlu7gtfaeh0ek0c05ksfhdpbcgglbe03")), true)
+
+// ── NSEC (RFC 4035 appendix A and B) ────────────────────────────────
+
+// One NSEC record of the zone of appendix A.
+fn ns(owner: Str, next: Str, types: [Int]) -> dnsnsec.NsecRr
+    dnsnsec.NsecRr { owner: nm(owner), next: nm(next), bitmap: dnsnsec.bitmap_encode(types) }
+
+// The chain of appendix A: example. to a.example. to ai.example. to
+// b.example. to ns1.example. to ns2.example. to *.w.example. to
+// x.w.example. to x.y.w.example. to xx.example. and back to example.
+fn chain() -> [dnsnsec.NsecRr]
+    [ns("example.", "a.example.", [2, 6, 15, 46, 47, 48]), ns("a.example.", "ai.example.", [2, 43, 46, 47]),
+     ns("ai.example.", "b.example.", [1, 13, 28, 46, 47]), ns("b.example.", "ns1.example.", [2, 46, 47]),
+     ns("ns1.example.", "ns2.example.", [1, 46, 47]), ns("ns2.example.", "*.w.example.", [1, 46, 47]),
+     ns("*.w.example.", "x.w.example.", [15, 46, 47]), ns("x.w.example.", "x.y.w.example.", [15, 46, 47]),
+     ns("x.y.w.example.", "xx.example.", [15, 46, 47]), ns("xx.example.", "example.", [1, 13, 28, 46, 47])]
+
+@test
+fn test_b2_a_name_error_is_proved_by_two_nsec_records() [io]
+    // ml.example. A: b.example. NSEC ns1.example. covers ml.example., and
+    // example. NSEC a.example. covers *.example.
+    let set = [ns("b.example.", "ns1.example.", [2, 46, 47]),
+        ns("example.", "a.example.", [2, 6, 15, 46, 47, 48])]
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("example."), nm("ml.example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("example."), nm("ML.Example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+    test.case("the whole chain proves the same")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("ml.example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+    test.case("without the record that covers the wildcard, or the one that covers the name")
+    test.assert_eq(dnsnsec.nsec_denial([ns("b.example.", "ns1.example.", [2, 46, 47])], nm("example."), nm("ml.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.assert_eq(dnsnsec.nsec_denial([ns("example.", "a.example.", [2, 6, 15, 46, 47, 48])], nm("example."), nm("ml.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_b3_no_data_is_proved_by_the_matching_nsec() [io]
+    let set = [ns("ns1.example.", "ns2.example.", [1, 46, 47])]
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("example."), nm("ns1.example."), 15), dnsnsec.DENIAL_NODATA)
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("example."), nm("ns1.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+    test.case("a record with CNAME denies no other type")
+    test.assert_eq(dnsnsec.nsec_denial([ns("c.example.", "d.example.", [5, 46, 47])], nm("example."), nm("c.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_a_delegation_without_a_ds_and_the_apex_which_cannot_prove_it() [io]
+    test.case("b.example. has NS, no SOA and no DS")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("b.example."), 43), dnsnsec.DENIAL_NO_DS)
+    test.case("a.example. has a DS")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("a.example."), 43), dnsnsec.DENIAL_NO_PROOF)
+    test.case("example. has SOA: its NSEC comes from the child's side")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("example."), 43), dnsnsec.DENIAL_NO_PROOF)
+    test.case("a name that is not a delegation: no data for DS")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("ns1.example."), 43), dnsnsec.DENIAL_NODATA)
+
+@test
+fn test_a_wildcard_with_no_data_and_an_expansion_are_proved() [io]
+    test.case("p.w.example. A: *.w.example. covers it, and matches the wildcard, which has MX and not A")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("p.w.example."), 1),
+        dnsnsec.DENIAL_NODATA_WILDCARD)
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("p.w.example."), 15), dnsnsec.DENIAL_NO_PROOF)
+    test.case("an answer for p.w.example. from *.w.example. has Labels 2, and p.w.example. is covered")
+    test.assert_eq(dnsnsec.nsec_wildcard_expansion_ok(chain(), nm("p.w.example."), 2), true)
+    test.assert_eq(dnsnsec.nsec_wildcard_expansion_ok(chain(), nm("p.w.example."), 3), false)
+    test.assert_eq(dnsnsec.nsec_wildcard_expansion_ok([], nm("p.w.example."), 2), false)
+    test.assert_eq(dnsnsec.nsec_wildcard_expansion_ok([ns("example.", "a.example.", [2])], nm("p.w.example."), 2),
+        false)
+
+@test
+fn test_the_last_nsec_of_the_chain_covers_what_follows_it() [io]
+    test.case("zzz.example. is after xx.example., whose next name is the apex")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("zzz.example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+    test.assert_eq(dnsnsec.nsec_covers(ns("xx.example.", "example.", [1]), nm("zzz.example.")), true)
+    test.assert_eq(dnsnsec.nsec_covers(ns("xx.example.", "example.", [1]), nm("a.example.")), false)
+    test.assert_eq(dnsnsec.nsec_covers(ns("a.example.", "ai.example.", [1]), nm("a.example.")), false)
+    test.assert_eq(dnsnsec.nsec_covers(ns("a.example.", "ai.example.", [1]), nm("ai.example.")), false)
+    test.assert_eq(dnsnsec.nsec_covers(ns("a.example.", "ai.example.", [1]), nm("abc.a.example.")), true)
+    test.assert_eq(dnsnsec.nsec_matches(ns("a.example.", "ai.example.", [1]), nm("A.EXAMPLE.")), true)
+    test.case("a name outside the zone proves nothing")
+    test.assert_eq(dnsnsec.nsec_denial(chain(), nm("example."), nm("www.other."), 1), dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_an_nsec_is_made_from_a_resource_record() [io]
+    let rd = dnsnsec.nsec_rdata(nm("a.example."), [2, 6, 15, 46, 47, 48])
+    match dnsnsec.nsec_rr(dnsrr.rr(nm("example."), 47, 1, 3600, rd))
+        Err(_) => test.assert_eq(true, false)
+        Ok(n)  =>
+            test.assert_eq(dns_codec.name_text(n.owner), "example.")
+            test.assert_eq(dns_codec.name_text(n.next), "a.example.")
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 48), true)
+    match dnsnsec.nsec_rr(dnsrr.rr(nm("example."), 47, 1, 3600, [1 as u8]))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(_) => test.assert_eq(true, true)
+
+@test
+fn test_the_denial_names() [io]
+    test.assert_eq(dnsnsec.denial_name(0), "no proof")
+    test.assert_eq(dnsnsec.denial_name(1), "the name does not exist")
+    test.assert_eq(dnsnsec.denial_name(2), "the name has no record of the type")
+    test.assert_eq(dnsnsec.denial_name(3), "a wildcard matches and has no record of the type")
+    test.assert_eq(dnsnsec.denial_name(4), "the delegation has no DS record")
+    test.assert_eq(dnsnsec.denial_name(5), "the span is opt-out")
+    test.assert_eq(dnsnsec.denial_name(9), "unknown")
+
+@test
+fn test_a_closest_encloser_outside_the_zone_proves_nothing() [io]
+    // The NSEC a.example. to z.example. covers x.sub.example., but the closest
+    // encloser it shows is example., which is above the zone sub.example.
+    let set = [ns("a.example.", "z.example.", [1])]
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("sub.example."), nm("x.sub.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_nsec3_records_that_match_no_ancestor_prove_nothing() [io]
+    test.assert_eq(dnsnsec.nsec3_denial([z_a()], nm("example."), nm("x.y.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_a_closest_encloser_above_the_zone_is_refused_even_when_the_wildcard_is_covered() [io]
+    // example. to z.example. covers x.sub.example. and also *.example., so a
+    // validator that accepted example. as the closest encloser would call this
+    // a name error in the zone sub.example.
+    let set = [ns("example.", "z.example.", [1, 2, 6])]
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("sub.example."), nm("x.sub.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("example."), nm("x.sub.example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+
+@test
+fn test_the_closest_encloser_comes_from_the_owner_or_from_the_next_name() [io]
+    test.case("the owner is below the encloser: y.example. to z.example.")
+    let from_owner = [ns("y.example.", "z.example.", [1])]
+    test.assert_eq(dnsnsec.nsec_denial(from_owner, nm("example."), nm("x.y.example."), 1),
+        dnsnsec.DENIAL_NXDOMAIN)
+    test.case("the next name is below the encloser: a.example. to b.y.example.")
+    let from_next = [ns("a.example.", "b.y.example.", [1])]
+    test.assert_eq(dnsnsec.nsec_denial(from_next, nm("example."), nm("a.y.example."), 1), dnsnsec.DENIAL_NXDOMAIN)
+
+@test
+fn test_a_wildcard_that_is_a_cname_proves_no_absence_of_the_type() [io]
+    // *.example. exists and holds a CNAME, so a query for A is answered by it.
+    let set = [ns("*.example.", "a.example.", [5]), ns("a.example.", "z.example.", [1])]
+    test.assert_eq(dnsnsec.nsec_denial(set, nm("example."), nm("m.example."), 1), dnsnsec.DENIAL_NO_PROOF)
+
+@test
+fn test_the_next_closer_name_of_a_wildcard_expansion_is_one_label_below_the_source() [io]
+    // a.b.sub.example. was expanded from *.sub.example. (Labels 2): the next
+    // closer name is b.sub.example., which a.sub.example. to c.sub.example.
+    // covers and sub.example. itself does not.
+    let set = [ns("a.sub.example.", "c.sub.example.", [1])]
+    test.assert_eq(dnsnsec.nsec_wildcard_expansion_ok(set, nm("a.b.sub.example."), 2), true)
+
+// A record that covers every hash except 0 and 1, to stand for "some record
+// covers this name" in the proofs below.
+fn n3_cover_all() -> dnsnsec.Nsec3Rr
+    n3("00000000000000000000000000000001", "00000000000000000000000000000000", [])
+
+@test
+fn test_an_nsec3_encloser_that_is_a_delegation_or_a_dname_proves_nothing_below_it() [io]
+    test.case("a.example. is a delegation: NS and no SOA")
+    test.assert_eq(dnsnsec.nsec3_denial([z_a(), n3_cover_all()], nm("example."), nm("www.a.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.case("a DNAME at a.example.")
+    let dname = n3(h("a.example."), "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv", [39, 46])
+    test.assert_eq(dnsnsec.nsec3_denial([dname, n3_cover_all()], nm("example."), nm("www.a.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.case("the same shape at a name with neither is a name error")
+    let plain = n3(h("a.example."), "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv", [1, 46])
+    test.assert_eq(dnsnsec.nsec3_denial([plain, n3_cover_all()], nm("example."), nm("www.a.example."), 1),
+        dnsnsec.DENIAL_NXDOMAIN)
+
+@test
+fn test_an_nsec3_wildcard_that_is_a_cname_proves_no_absence_of_the_type() [io]
+    let wild = n3(h("*.example."), "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv", [5, 46])
+    test.assert_eq(dnsnsec.nsec3_denial([z_example(), wild, n3_cover_all()], nm("example."), nm("www.example."), 1),
+        dnsnsec.DENIAL_NO_PROOF)
+    test.case("a wildcard with other types is a no-data")
+    let other = n3(h("*.example."), "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv", [15, 46])
+    test.assert_eq(dnsnsec.nsec3_denial([z_example(), other, n3_cover_all()], nm("example."), nm("www.example."), 1),
+        dnsnsec.DENIAL_NODATA_WILDCARD)

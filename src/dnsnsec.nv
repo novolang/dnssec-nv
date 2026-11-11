@@ -1,0 +1,565 @@
+// dnsnsec.nv — authenticated denial of existence: the type bitmap and the
+// NSEC record (RFC 4034 section 4), the NSEC3 and NSEC3PARAM records and
+// the hashed owner names of RFC 5155, and the proofs that a name or a
+// type does not exist (RFC 4035 section 5.4, RFC 5155 section 8, RFC 6840
+// section 4).
+//
+// The proofs read records the caller has already checked with
+// `dnsvalid.validate_rrset`: this module decides what a set of NSEC or
+// NSEC3 records proves, not whether they are signed.  It answers one of
+// the `DENIAL_*` numbers.
+//
+// Nothing in this module performs input or output or reads a clock.
+
+use std.bytes
+use std.str
+use hashing
+use dns_codec
+use dnsrr
+use dnskey
+
+// ── Answers of a proof ──────────────────────────────────────────────
+
+// The records prove nothing about the question.
+pub const DENIAL_NO_PROOF = 0
+// The name does not exist, and no wildcard could have answered for it.
+pub const DENIAL_NXDOMAIN = 1
+// The name exists and has no record of the type, nor a CNAME.
+pub const DENIAL_NODATA = 2
+// The name does not exist but a wildcard matches it, and the wildcard has
+// no record of the type, nor a CNAME.
+pub const DENIAL_NODATA_WILDCARD = 3
+// The name is a delegation with no DS record: the child zone is insecure.
+pub const DENIAL_NO_DS = 4
+// The name is not covered by a signed NSEC3 record because the span that
+// covers it has the Opt-Out flag: an unsigned delegation may be there
+// (RFC 5155 section 6), and the answer is insecure, not proven.
+pub const DENIAL_OPT_OUT = 5
+
+// The words for an answer of a proof, for a log line.
+pub fn denial_name(d: Int) -> Str
+    match d
+        0 => "no proof"
+        1 => "the name does not exist"
+        2 => "the name has no record of the type"
+        3 => "a wildcard matches and has no record of the type"
+        4 => "the delegation has no DS record"
+        5 => "the span is opt-out"
+        _ => "unknown"
+
+// ── Type bitmaps (RFC 4034 section 4.1.2) ───────────────────────────
+
+// The bitmap of a list of type numbers: windows of 256 types, each a
+// block number, a length of 1 to 32 bytes, and the bits, the most
+// significant bit of the first byte being type 0 of the window.  Windows
+// with no type are omitted and a window's bytes stop at its last set bit.
+pub fn bitmap_encode(types: [Int]) -> [u8]
+    var out: [u8] = []
+    for window in 0..256
+        var window_bits: [Int] = []
+        for _ in 0..32
+            window_bits = list.push(window_bits, 0)
+        var top = -1
+        for t in types
+            if t >= window * 256 and t < window * 256 + 256
+                let low = t - window * 256
+                let byte = low / 8
+                window_bits[byte] = window_bits[byte] | (128 >> (low % 8))
+                if byte > top
+                    top = byte
+        if top >= 0
+            out = list.push(out, window as u8)
+            out = list.push(out, (top + 1) as u8)
+            for i in 0..top + 1
+                out = list.push(out, window_bits[i] as u8)
+    out
+
+// Whether the type `t` is set in the bitmap `bm`; a bitmap that is
+// malformed past the window of `t` is read as far as it goes.
+pub fn bitmap_has(bm: [u8], t: Int) -> Bool
+    var pos = 0
+    var found = false
+    var live = true
+    for _ in 0..256
+        if live and pos + 2 <= list.len(bm)
+            let window = bm[pos] as Int
+            let len = bm[pos + 1] as Int
+            if len < 1 or len > 32 or pos + 2 + len > list.len(bm)
+                live = false
+            else
+                if window == t / 256
+                    let low = t % 256
+                    let byte = low / 8
+                    if byte < len and (bm[pos + 2 + byte] as Int & (128 >> (low % 8))) != 0
+                        found = true
+                    live = false
+                pos = pos + 2 + len
+        else
+            live = false
+    found
+
+// The type numbers set in a bitmap, in order, or `DnssecBadBitmap` when a
+// window block is out of order, has a length outside 1 to 32, or runs
+// past the end (section 4.1.2).
+pub fn bitmap_types(bm: [u8]) -> Result<[Int], dnskey.DnssecError>
+    var out: [Int] = []
+    var pos = 0
+    var last = -1
+    for _ in 0..256
+        if pos < list.len(bm)
+            if pos + 2 > list.len(bm)
+                return Err(dnskey.DnssecBadBitmap)
+            let window = bm[pos] as Int
+            let len = bm[pos + 1] as Int
+            if window <= last or len < 1 or len > 32 or pos + 2 + len > list.len(bm)
+                return Err(dnskey.DnssecBadBitmap)
+            for i in 0..len
+                for b in 0..8
+                    if (bm[pos + 2 + i] as Int & (128 >> b)) != 0
+                        out = list.push(out, window * 256 + i * 8 + b)
+            last = window
+            pos = pos + 2 + len
+    Ok(out)
+
+// Whether a bitmap follows section 4.1.2.
+pub fn bitmap_is_valid(bm: [u8]) -> Bool
+    match bitmap_types(bm)
+        Ok(_)  => true
+        Err(_) => false
+
+// ── NSEC ────────────────────────────────────────────────────────────
+
+// An NSEC record's RDATA read into fields.
+pub struct Nsec
+    next: dns_codec.DnsName
+    bitmap: [u8]
+
+// The offset after the uncompressed name at `pos` of `rdata`, or -1.
+fn name_end(rdata: [u8], pos: Int) -> Int
+    var at = pos
+    var end = -1
+    var live = true
+    for _ in 0..130
+        if live and at < list.len(rdata)
+            let len = rdata[at] as Int
+            if len == 0
+                end = at + 1
+                live = false
+            elif len >= 64 or at + 1 + len >= list.len(rdata)
+                live = false
+            else
+                at = at + 1 + len
+        else
+            live = false
+    end
+
+// Read the RDATA of an NSEC record: the next owner name, which is not
+// compressed, and the type bitmap, which must follow section 4.1.2.
+pub fn nsec_parse(rdata: [u8]) -> Result<Nsec, dnskey.DnssecError>
+    let end = name_end(rdata, 0)
+    if end < 0
+        return Err(dnskey.DnssecBadName)
+    let bm = list.slice(rdata, end, list.len(rdata))
+    if not bitmap_is_valid(bm)
+        return Err(dnskey.DnssecBadBitmap)
+    match dns_codec.decode_name(rdata, 0)
+        Err(_)   => Err(dnskey.DnssecBadName)
+        Ok(read) => Ok(Nsec { next: read.name, bitmap: bm })
+
+// The RDATA of an NSEC record naming `next` and the types `types`.
+pub fn nsec_rdata(next: dns_codec.DnsName, types: [Int]) -> [u8]
+    dnsrr.cat(next.wire, bitmap_encode(types))
+
+// An NSEC record with its owner.
+pub struct NsecRr
+    owner: dns_codec.DnsName
+    next: dns_codec.DnsName
+    bitmap: [u8]
+
+// An NSEC record from a resource record of type NSEC.
+pub fn nsec_rr(r: dnsrr.DnsRr) -> Result<NsecRr, dnskey.DnssecError>
+    match nsec_parse(r.rdata)
+        Err(e)   => Err(e)
+        Ok(nsec) => Ok(NsecRr { owner: r.name, next: nsec.next, bitmap: nsec.bitmap })
+
+// Whether the NSEC record `n` covers `name`: the name is after the owner
+// and before the next name in the canonical order, or, for the last
+// record of the chain whose next name is the apex, after the owner or
+// before the next name (RFC 4034 section 4.1.1).
+pub fn nsec_covers(n: NsecRr, name: dns_codec.DnsName) -> Bool
+    let after_owner = dnsrr.name_cmp(n.owner, name) < 0
+    let before_next = dnsrr.name_cmp(name, n.next) < 0
+    if dnsrr.name_cmp(n.owner, n.next) < 0
+        after_owner and before_next
+    else
+        after_owner or before_next
+
+// Whether the NSEC record `n` is at `name`.
+pub fn nsec_matches(n: NsecRr, name: dns_codec.DnsName) -> Bool
+    dns_codec.name_eq(n.owner, name)
+
+// The index in `nsecs` of the record at `name`, or -1.
+fn nsec_find_match(nsecs: [NsecRr], name: dns_codec.DnsName) -> Int
+    for i in 0..list.len(nsecs)
+        if nsec_matches(nsecs[i], name)
+            return i
+    -1
+
+// The index in `nsecs` of the record that covers `name`, or -1.
+fn nsec_find_cover(nsecs: [NsecRr], name: dns_codec.DnsName) -> Int
+    for i in 0..list.len(nsecs)
+        if nsec_covers(nsecs[i], name)
+            return i
+    -1
+
+// The closest encloser of `qname` that the NSEC `n`, which covers it,
+// shows: the longest ancestor of `qname` that is also an ancestor of
+// the NSEC's owner or of its next name (RFC 4035 section 5.4, RFC 6840
+// section 4.1).
+fn nsec_closest_encloser(n: NsecRr, qname: dns_codec.DnsName) -> dns_codec.DnsName
+    var best = dns_codec.root_name()
+    var cur = qname
+    for _ in 0..130
+        if dns_codec.name_label_count(cur) > 0
+            cur = dnsrr.parent_name(cur)
+            if dnsrr.is_at_or_below(n.owner, cur) or dnsrr.is_at_or_below(n.next, cur)
+                if dns_codec.name_label_count(cur) > dns_codec.name_label_count(best)
+                    best = cur
+    best
+
+// What the NSEC records `nsecs`, taken from the zone `zone` and already
+// authenticated, prove about the question `qname` and `qtype`.
+//
+// - A record at `qname` that lacks `qtype` and CNAME proves
+//   `DENIAL_NODATA`; for a DS question at a delegation (NS set, SOA
+//   clear) it proves `DENIAL_NO_DS`; one that has SOA and a DS question
+//   is from the child apex and proves nothing.
+// - A record that covers `qname` and one that covers the wildcard at the
+//   closest encloser prove `DENIAL_NXDOMAIN` (RFC 4035 section 5.4).
+// - A record that covers `qname` and one at the wildcard that lacks
+//   `qtype` prove `DENIAL_NODATA_WILDCARD`.
+pub fn nsec_denial(nsecs: [NsecRr], zone: dns_codec.DnsName, qname: dns_codec.DnsName,
+                   qtype: Int) -> Int
+    if not dnsrr.is_at_or_below(qname, zone)
+        return DENIAL_NO_PROOF
+    let m = nsec_find_match(nsecs, qname)
+    if m >= 0
+        let bm = nsecs[m].bitmap
+        if qtype == dnsrr.RR_TYPE_DS
+            if bitmap_has(bm, dnsrr.RR_TYPE_SOA) or bitmap_has(bm, dnsrr.RR_TYPE_DS)
+                return DENIAL_NO_PROOF
+            if bitmap_has(bm, dnsrr.RR_TYPE_NS)
+                return DENIAL_NO_DS
+            return DENIAL_NODATA
+        if bitmap_has(bm, qtype) or bitmap_has(bm, dnsrr.RR_TYPE_CNAME)
+            return DENIAL_NO_PROOF
+        return DENIAL_NODATA
+    let c = nsec_find_cover(nsecs, qname)
+    if c < 0
+        return DENIAL_NO_PROOF
+    let ce = nsec_closest_encloser(nsecs[c], qname)
+    if not dnsrr.is_at_or_below(ce, zone)
+        return DENIAL_NO_PROOF
+    let wildcard = dnsrr.wildcard_below(ce)
+    let w = nsec_find_match(nsecs, wildcard)
+    if w >= 0
+        let wb = nsecs[w].bitmap
+        if bitmap_has(wb, qtype) or bitmap_has(wb, dnsrr.RR_TYPE_CNAME)
+            return DENIAL_NO_PROOF
+        return DENIAL_NODATA_WILDCARD
+    if nsec_find_cover(nsecs, wildcard) >= 0
+        DENIAL_NXDOMAIN
+    else
+        DENIAL_NO_PROOF
+
+// Whether an answer that was expanded from a wildcard is legitimate:
+// `sig_labels` is the Labels field of the answer's RRSIG, the answer's
+// owner `qname` has more labels, and an NSEC in `nsecs` covers the next
+// closer name, the name with one label more than the wildcard's source
+// (RFC 4035 section 5.3.4).
+pub fn nsec_wildcard_expansion_ok(nsecs: [NsecRr], qname: dns_codec.DnsName,
+                                  sig_labels: Int) -> Bool
+    if sig_labels >= dnsrr.label_count_for_rrsig(qname)
+        return false
+    nsec_find_cover(nsecs, dnsrr.name_suffix(qname, sig_labels + 1)) >= 0
+
+// ── base32hex (RFC 4648 section 7) ──────────────────────────────────
+
+// The letter for a 5-bit value, in lower case.
+fn b32_char(v: Int) -> Str
+    str.slice("0123456789abcdefghijklmnopqrstuv", v, v + 1)
+
+// The 5-bit value of a base32hex character, either case, or -1.
+fn b32_value(c: Int) -> Int
+    if c >= '0' and c <= '9'
+        c - '0'
+    elif c >= 'a' and c <= 'v'
+        c - 'a' + 10
+    elif c >= 'A' and c <= 'V'
+        c - 'A' + 10
+    else
+        -1
+
+// The base32hex text of bytes, in lower case, without padding.
+pub fn base32hex_encode(b: [u8]) -> Str
+    var out = ""
+    var acc = 0
+    var nbits = 0
+    for x in b
+        acc = (acc << 8) | x as Int
+        nbits = nbits + 8
+        for _ in 0..2
+            if nbits >= 5
+                out = out + b32_char((acc >> (nbits - 5)) & 31)
+                nbits = nbits - 5
+        acc = acc & 255
+    if nbits > 0
+        out = out + b32_char((acc << (5 - nbits)) & 31)
+    out
+
+// The bytes of base32hex characters (the byte values of the text) without
+// padding, in either case, or `None` for a character that is not in the
+// alphabet or bits left over that are not zero.
+fn b32_decode(chars: [Int]) -> ?[u8]
+    var out: [u8] = []
+    var acc = 0
+    var nbits = 0
+    for c in chars
+        let v = b32_value(c)
+        if v < 0
+            return None
+        acc = (acc << 5) | v
+        nbits = nbits + 5
+        if nbits >= 8
+            out = list.push(out, ((acc >> (nbits - 8)) & 255) as u8)
+            nbits = nbits - 8
+            acc = acc & 255
+    if nbits > 0 and (acc & ((1 << nbits) - 1)) != 0
+        return None
+    Some(out)
+
+// The bytes of base32hex text without padding, in either case, or `None`
+// for a character that is not in the alphabet or bits left over that are
+// not zero.
+pub fn base32hex_decode(text: Str) -> ?[u8]
+    var chars: [Int] = []
+    for i in 0..str.len(text)
+        chars = list.push(chars, str.byte_at_or(text, i, 0))
+    b32_decode(chars)
+
+// ── NSEC3 (RFC 5155) ────────────────────────────────────────────────
+
+// The hash algorithm number of NSEC3 and NSEC3PARAM: SHA-1, the only one
+// defined.
+pub const NSEC3_HASH_SHA1 = 1
+
+// The Opt-Out bit of the NSEC3 flags.
+pub const NSEC3_FLAG_OPT_OUT = 1
+
+// The hash of a name for NSEC3 (section 5): SHA-1 of the canonical owner
+// name and the salt, then `iterations` more rounds of SHA-1 over the last
+// digest and the salt.
+pub fn nsec3_hash(name: dns_codec.DnsName, iterations: Int, salt: [u8]) -> [u8]
+    var digest = bytes.to_byte_list(hashing.sha1(bytes.from_byte_list(dnsrr.cat(dnsrr.name_wire(name), salt))))
+    for _ in 0..iterations
+        digest = bytes.to_byte_list(hashing.sha1(bytes.from_byte_list(dnsrr.cat(digest, salt))))
+    digest
+
+// An NSEC3 record's RDATA read into fields.
+pub struct Nsec3
+    algorithm: Int
+    flags: Int
+    iterations: Int
+    salt: [u8]
+    next_hash: [u8]
+    bitmap: [u8]
+
+// Read the RDATA of an NSEC3 record (section 3.2): the hash algorithm, the
+// flags, the iterations, the salt, the next hashed owner name and the type
+// bitmap.
+pub fn nsec3_parse(rdata: [u8]) -> Result<Nsec3, dnskey.DnssecError>
+    if list.len(rdata) < 6
+        return Err(dnskey.DnssecTruncated(list.len(rdata), 6))
+    let salt_len = rdata[4] as Int
+    if 5 + salt_len + 1 > list.len(rdata)
+        return Err(dnskey.DnssecBadNsec3)
+    let hash_len = rdata[5 + salt_len] as Int
+    let hash_at = 6 + salt_len
+    if hash_len == 0 or hash_at + hash_len > list.len(rdata)
+        return Err(dnskey.DnssecBadNsec3)
+    let bm = list.slice(rdata, hash_at + hash_len, list.len(rdata))
+    if not bitmap_is_valid(bm)
+        return Err(dnskey.DnssecBadBitmap)
+    Ok(Nsec3 { algorithm: rdata[0] as Int, flags: rdata[1] as Int, iterations: (rdata[2] as Int << 8) | rdata[3] as Int,
+               salt: list.slice(rdata, 5, 5 + salt_len), next_hash: list.slice(rdata, hash_at, hash_at + hash_len), bitmap: bm })
+
+// The RDATA of an NSEC3 record.
+pub fn nsec3_rdata(r: Nsec3) -> [u8]
+    var out: [u8] = [r.algorithm as u8,
+        r.flags as u8,
+        ((r.iterations >> 8) & 255) as u8,
+        (r.iterations & 255) as u8,
+        list.len(r.salt) as u8]
+    out = dnsrr.cat(out, r.salt)
+    out = list.push(out, list.len(r.next_hash) as u8)
+    out = dnsrr.cat(out, r.next_hash)
+    dnsrr.cat(out, r.bitmap)
+
+// An NSEC3PARAM record's RDATA: the parameters the zone's NSEC3 records
+// are made with (section 4).
+pub struct Nsec3Param
+    algorithm: Int
+    flags: Int
+    iterations: Int
+    salt: [u8]
+
+// Read the RDATA of an NSEC3PARAM record.
+pub fn nsec3param_parse(rdata: [u8]) -> Result<Nsec3Param, dnskey.DnssecError>
+    if list.len(rdata) < 5
+        return Err(dnskey.DnssecTruncated(list.len(rdata), 5))
+    let salt_len = rdata[4] as Int
+    if 5 + salt_len != list.len(rdata)
+        return Err(dnskey.DnssecBadNsec3)
+    Ok(Nsec3Param { algorithm: rdata[0] as Int,
+        flags: rdata[1] as Int,
+        iterations: (rdata[2] as Int << 8) | rdata[3] as Int,
+        salt: list.slice(rdata, 5, 5 + salt_len) })
+
+// An NSEC3 record with the hash of its owner (decoded from the first
+// label of its name) and the zone it belongs to (the name without that
+// label).
+pub struct Nsec3Rr
+    owner_hash: [u8]
+    zone: dns_codec.DnsName
+    rec: Nsec3
+
+// An NSEC3 record from a resource record of type NSEC3, whose owner name
+// is the base32hex hash and the zone.  `DnssecBadName` when the first
+// label is not the base32hex of a hash.
+pub fn nsec3_rr(r: dnsrr.DnsRr) -> Result<Nsec3Rr, dnskey.DnssecError>
+    let labels = dns_codec.name_labels(r.name)
+    if list.len(labels) < 1
+        return Err(dnskey.DnssecBadName)
+    match nsec3_parse(r.rdata)
+        Err(e)  => Err(e)
+        Ok(rec) =>
+            var chars: [Int] = []
+            for c in labels[0]
+                chars = list.push(chars, c as Int)
+            match b32_decode(chars)
+                None    => Err(dnskey.DnssecBadName)
+                Some(h) => Ok(Nsec3Rr { owner_hash: h, zone: dnsrr.parent_name(r.name), rec: rec })
+
+// Whether the NSEC3 record `n` covers the hash `h`: it is after the
+// owner's hash and before the next hash, or, for the last record of the
+// chain, after the owner's hash or before the next one.
+pub fn nsec3_covers(n: Nsec3Rr, h: [u8]) -> Bool
+    let after_owner = dnsrr.bytes_cmp(n.owner_hash, h) < 0
+    let before_next = dnsrr.bytes_cmp(h, n.rec.next_hash) < 0
+    if dnsrr.bytes_cmp(n.owner_hash, n.rec.next_hash) < 0
+        after_owner and before_next
+    else
+        after_owner or before_next
+
+// The index in `nsec3s` of the record whose owner hash is `h`, or -1.
+fn nsec3_find_match(nsec3s: [Nsec3Rr], h: [u8]) -> Int
+    for i in 0..list.len(nsec3s)
+        if dnsrr.bytes_cmp(nsec3s[i].owner_hash, h) == 0
+            return i
+    -1
+
+// The index in `nsec3s` of the record that covers `h`, or -1.
+fn nsec3_find_cover(nsec3s: [Nsec3Rr], h: [u8]) -> Int
+    for i in 0..list.len(nsec3s)
+        if nsec3_covers(nsec3s[i], h)
+            return i
+    -1
+
+// What the NSEC3 records `nsec3s`, taken from the zone `zone` and already
+// authenticated, prove about the question `qname` and `qtype` (RFC 5155
+// section 8). All the records must use the parameters of the first and the
+// algorithm 1; otherwise nothing is proven.
+//
+// - A record that matches the hash of `qname` and lacks `qtype` and CNAME
+//   proves `DENIAL_NODATA`; for a DS question at a delegation it proves
+//   `DENIAL_NO_DS` (section 8.6); one with SOA and a DS question proves
+//   nothing.
+// - Otherwise the closest provable encloser is the longest ancestor of
+//   `qname` whose hash is matched; it must not be a delegation or a DNAME.
+//   A record covering the next closer name and one covering the wildcard at
+//   the closest encloser prove `DENIAL_NXDOMAIN` (section 8.4); with a
+//   record matching the wildcard that lacks `qtype`, `DENIAL_NODATA_WILDCARD`
+//   (section 8.7).
+// - For a DS question, a next closer name covered by a record with the
+//   Opt-Out flag proves `DENIAL_OPT_OUT`: an unsigned delegation may be
+//   there (section 8.6). A name error proof does not depend on the flag
+//   (section 8.4).
+pub fn nsec3_denial(nsec3s: [Nsec3Rr], zone: dns_codec.DnsName, qname: dns_codec.DnsName,
+                    qtype: Int) -> Int
+    if list.len(nsec3s) == 0 or not dnsrr.is_at_or_below(qname, zone)
+        return DENIAL_NO_PROOF
+    let first = nsec3s[0].rec
+    for n in nsec3s
+        if n.rec.algorithm != NSEC3_HASH_SHA1 or n.rec.iterations != first.iterations or dnsrr.bytes_cmp(n.rec.salt, first.salt) != 0 or not dns_codec.name_eq(n.zone, zone)
+            return DENIAL_NO_PROOF
+    let iterations = first.iterations
+    let salt = first.salt
+    let m = nsec3_find_match(nsec3s, nsec3_hash(qname, iterations, salt))
+    if m >= 0
+        // workaround(a-let-binding-of-a-list-field-two-projections-below-a-list-element-is-released-without-a-retain): a list two projections below a list element, bound to a name, is released without a retain, so the element is bound first.
+        let matched = nsec3s[m]
+        let bm = matched.rec.bitmap
+        if qtype == dnsrr.RR_TYPE_DS
+            if bitmap_has(bm, dnsrr.RR_TYPE_SOA) or bitmap_has(bm, dnsrr.RR_TYPE_DS)
+                return DENIAL_NO_PROOF
+            if bitmap_has(bm, dnsrr.RR_TYPE_NS)
+                return DENIAL_NO_DS
+            return DENIAL_NODATA
+        if bitmap_has(bm, qtype) or bitmap_has(bm, dnsrr.RR_TYPE_CNAME)
+            return DENIAL_NO_PROOF
+        return DENIAL_NODATA
+    // The closest provable encloser.
+    var ce = dnsrr.parent_name(qname)
+    var ce_at = -1
+    for _ in 0..130
+        if ce_at < 0 and dnsrr.is_at_or_below(ce, zone)
+            ce_at = nsec3_find_match(nsec3s, nsec3_hash(ce, iterations, salt))
+            if ce_at < 0 and dns_codec.name_label_count(ce) > 0
+                ce = dnsrr.parent_name(ce)
+    if ce_at < 0
+        return DENIAL_NO_PROOF
+    // workaround(a-let-binding-of-a-list-field-two-projections-below-a-list-element-is-released-without-a-retain): a list two projections below a list element, bound to a name, is released without a retain, so the element is bound first.
+    let encloser = nsec3s[ce_at]
+    let ceb = encloser.rec.bitmap
+    if bitmap_has(ceb, dnsrr.RR_TYPE_NS) and not bitmap_has(ceb, dnsrr.RR_TYPE_SOA) or bitmap_has(ceb, dnsrr.RR_TYPE_DNAME)
+        return DENIAL_NO_PROOF
+    let next_closer = dnsrr.name_suffix(qname, dns_codec.name_label_count(ce) + 1)
+    let c = nsec3_find_cover(nsec3s, nsec3_hash(next_closer, iterations, salt))
+    if c < 0
+        return DENIAL_NO_PROOF
+    let optout = (nsec3s[c].rec.flags & NSEC3_FLAG_OPT_OUT) != 0
+    if optout and qtype == dnsrr.RR_TYPE_DS
+        return DENIAL_OPT_OUT
+    let wildcard = dnsrr.wildcard_below(ce)
+    let w = nsec3_find_match(nsec3s, nsec3_hash(wildcard, iterations, salt))
+    if w >= 0
+        // workaround(a-let-binding-of-a-list-field-two-projections-below-a-list-element-is-released-without-a-retain): a list two projections below a list element, bound to a name, is released without a retain, so the element is bound first.
+        let wild = nsec3s[w]
+        let wb = wild.rec.bitmap
+        if bitmap_has(wb, qtype) or bitmap_has(wb, dnsrr.RR_TYPE_CNAME)
+            return DENIAL_NO_PROOF
+        return DENIAL_NODATA_WILDCARD
+    if nsec3_find_cover(nsec3s, nsec3_hash(wildcard, iterations, salt)) < 0
+        DENIAL_NO_PROOF
+    else
+        DENIAL_NXDOMAIN
+
+// Whether an answer expanded from a wildcard is legitimate (RFC 5155
+// section 8.8): `sig_labels` is the RRSIG's Labels field, `qname` has more
+// labels, and a record in `nsec3s` covers the hash of the next closer name.
+pub fn nsec3_wildcard_expansion_ok(nsec3s: [Nsec3Rr], qname: dns_codec.DnsName,
+                                   sig_labels: Int) -> Bool
+    if list.len(nsec3s) == 0 or sig_labels >= dnsrr.label_count_for_rrsig(qname)
+        return false
+    let first = nsec3s[0].rec
+    nsec3_find_cover(nsec3s, nsec3_hash(dnsrr.name_suffix(qname, sig_labels + 1), first.iterations, first.salt)) >= 0

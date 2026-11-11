@@ -1,0 +1,45 @@
+[package]
+name        = "dnssec-nv"
+version     = "0.1.0"
+description = "DNSSEC validation (RFC 4033 to RFC 4035, RFC 5155, RFC 6840) with no socket: the DNSKEY, RRSIG, DS, NSEC, NSEC3 and CDS/CDNSKEY records, the key tag, the canonical form and order of an RRset, RRSIG verification with RSA/SHA-256, ECDSA P-256 and Ed25519, the validation of a chain from a trust anchor to a signed RRset with the states secure, insecure, bogus and indeterminate, and authenticated denial of existence by NSEC and NSEC3."
+license     = "Apache-2.0"
+
+stability   = "experimental"
+
+# `core`: records in, a verdict out.  The resolver that fetches the
+# RRsets, the clock and the cache are the caller's, and none of them is
+# here.  The package makes no `@tier(embedded)` claim.  An RRset is a
+# list of records, a key and a signature are `Bytes` and lists, and the
+# signature packages it verifies with (`rsa-nv`, `p256-nv` and
+# `ed25519-nv`) are arithmetic over lists, none of them annotated for a
+# tier below `app`.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["dnssec", "dns", "rfc4034", "rfc4035", "rfc5155", "nsec", "nsec3", "rrsig", "validation", "trust-anchor", "sans-io"]
+repository  = "https://github.com/novolang/dnssec-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "Checking a DNS answer against its signatures"
+
+[dependencies]
+# The names and records.  A name is a `DnsName` and a record that came
+# out of a message is a `DnsRecord`; both are dns-codec-nv's, so a
+# resolver that decodes with the codec hands the records straight over.
+dns-codec-nv = "^0.1.1"
+
+# SHA-1, SHA-256 and SHA-384 for the DS digests and the NSEC3 hash, and
+# SHA-256 for the digest an ECDSA signature is made over.
+crypto-nv = "^0.1.8"
+
+# RSASSA-PKCS1-v1_5 verification, for algorithm 8.
+rsa-nv = "^0.1.0"
+
+# ECDSA over P-256, for algorithm 13.
+p256-nv = "^0.1.1"
+
+# Ed25519, for algorithm 15.
+ed25519-nv = "^0.1.1"

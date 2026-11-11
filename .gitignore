@@ -1,0 +1,11 @@
+# Everything named here is something the toolchain writes into this
+# directory and never publishes.
+_novo/
+APIDOC.md
+dnssec-nv
+*.elf
+*.hex
+*.bin
+*.map
+.vscode/settings.json.user
+*.swp

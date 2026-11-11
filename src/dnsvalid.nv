@@ -1,0 +1,349 @@
+// dnsvalid.nv — the validation of an answer from a trust anchor (RFC 4033
+// section 5, RFC 4035 section 5): the chain of keys from the anchor down
+// the zone cuts, and the check of an RRset against the keys of its zone.
+//
+// Nothing here fetches. The caller, a resolver, supplies the RRsets of
+// each zone cut as `ZoneLink` values, from the zone of the trust anchor
+// downwards, and the time as a number of seconds since 1970. The answer
+// is a `Validation` with one of the four states of RFC 4033 section 5:
+// secure, insecure, bogus or indeterminate.
+//
+// The algorithms checked are RSA/SHA-256 (8), ECDSA P-256 (13) and Ed25519
+// (15). A zone whose DS records name only other algorithms, or digest types
+// this package does not compute, is insecure (RFC 6840 section 5.2).
+//
+// Nothing in this module performs input or output or reads a clock.
+
+use dns_codec
+use dnsrr
+use dnskey
+use dnsrrsig
+
+// ── States and reasons ──────────────────────────────────────────────
+
+// The data is authenticated from a trust anchor (RFC 4033 section 5).
+pub const STATE_SECURE = 0
+// The data is in a zone that is provably not signed, or signed only with
+// algorithms or digests that are not supported.
+pub const STATE_INSECURE = 1
+// The data should have been authenticated and was not: a signature that
+// does not verify, has expired, or is missing, or a key that no DS names.
+pub const STATE_BOGUS = 2
+// Nothing can be said: the records needed were not supplied.
+pub const STATE_INDETERMINATE = 3
+
+// The words for a state.
+pub fn state_name(s: Int) -> Str
+    match s
+        0 => "secure"
+        1 => "insecure"
+        2 => "bogus"
+        3 => "indeterminate"
+        _ => "unknown"
+
+// No reason: the data is secure.
+pub const REASON_NONE = 0
+// The chain has no link, or the answer is not under the zone the chain
+// ends at.
+pub const REASON_NO_CHAIN = 1
+// A link is not under the one before it.
+pub const REASON_OUT_OF_ORDER = 2
+// No trust anchor was given.
+pub const REASON_NO_ANCHOR = 3
+// No DS record was supplied for a zone below the first, and no proof that
+// there is none.
+pub const REASON_NO_DS = 4
+// The parent proved that the child has no DS record.
+pub const REASON_DS_ABSENT = 5
+// No DS record names an algorithm and a digest this package supports.
+pub const REASON_UNSUPPORTED = 6
+// A DS RRset that no key of the parent signed, or with no signature.
+pub const REASON_DS_NOT_SIGNED = 7
+// No DNSKEY of the zone is named by a DS record.
+pub const REASON_NO_KEY_FOR_DS = 8
+// The DNSKEY RRset is not signed by a key a DS record names.
+pub const REASON_DNSKEY_NOT_SIGNED = 9
+// The RRset has no signature.
+pub const REASON_NO_SIGNATURE = 10
+// No signature of the RRset verifies; the verdict of the last one tried is
+// in `detail`.
+pub const REASON_SIGNATURE_FAILED = 11
+// Every signature of the RRset is made with an algorithm this package
+// does not verify.
+pub const REASON_ALGORITHM = 12
+// The RRset's signer is not the zone the chain ends at.
+pub const REASON_WRONG_SIGNER = 13
+
+// The words for a reason.
+pub fn reason_name(r: Int) -> Str
+    match r
+        0  => "authenticated"
+        1  => "the chain does not reach the answer"
+        2  => "a zone is not below the zone before it"
+        3  => "no trust anchor was given"
+        4  => "no DS record was supplied"
+        5  => "the parent proved there is no DS record"
+        6  => "no DS record names a supported algorithm and digest"
+        7  => "the DS RRset is not signed by the parent"
+        8  => "no DNSKEY is named by a DS record"
+        9  => "the DNSKEY RRset is not signed by a key a DS record names"
+        10 => "the RRset has no signature"
+        11 => "no signature of the RRset verifies"
+        12 => "the signatures use an algorithm that is not supported"
+        13 => "the signer is not the zone the chain ends at"
+        _  => "unknown"
+
+// The answer of a validation.
+pub struct Validation
+    state: Int
+    reason: Int
+    // The zone the validation got as far as.
+    zone: dns_codec.DnsName
+    // The verdict of `dnsrrsig.verify` that settled it, for a signature
+    // that failed; `VERDICT_OK` otherwise.
+    detail: Int
+    // The keys of the zone, when it is secure.
+    keys: [dnskey.Dnskey]
+
+// A validation that failed or could not be made.
+fn outcome(state: Int, reason: Int, zone: dns_codec.DnsName, detail: Int) -> Validation
+    Validation { state: state, reason: reason, zone: zone, detail: detail, keys: [] }
+
+// ── The root trust anchor ───────────────────────────────────────────
+
+// The DS record of the root zone's key-signing key KSK-2024, key tag
+// 38696, as the IANA publishes it in the trust anchor file
+// https://data.iana.org/root-anchors/root-anchors.xml, valid from
+// 2024-07-18: algorithm 8, digest type 2, and the digest
+// 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16.
+pub fn root_trust_anchor() -> dnskey.Ds
+    dnskey.Ds { key_tag: 38696, algorithm: 8, digest_type: 2, digest: [0x68 as u8,
+        0x3D as u8,
+        0x2D as u8,
+        0x0A as u8,
+        0xCB as u8,
+        0x8C as u8,
+        0x9B as u8,
+        0x71 as u8,
+        0x2A as u8,
+        0x19 as u8,
+        0x48 as u8,
+        0xB2 as u8,
+        0x7F as u8,
+        0x74 as u8,
+        0x12 as u8,
+        0x19 as u8,
+        0x29 as u8,
+        0x8D as u8,
+        0x0A as u8,
+        0x45 as u8,
+        0x0D as u8,
+        0x61 as u8,
+        0x2C as u8,
+        0x48 as u8,
+        0x3A as u8,
+        0xF4 as u8,
+        0x44 as u8,
+        0xA4 as u8,
+        0xC0 as u8,
+        0xFB as u8,
+        0x2B as u8,
+        0x16 as u8] }
+
+// ── Keys ────────────────────────────────────────────────────────────
+
+// Whether an algorithm number is one this package verifies.
+pub fn algorithm_supported(algorithm: Int) -> Bool
+    algorithm == dnskey.ALG_RSASHA256 or algorithm == dnskey.ALG_ECDSAP256SHA256 or algorithm == dnskey.ALG_ED25519
+
+// The DNSKEYs of an RRset of DNSKEY records that parse, are zone keys
+// and are not revoked. A record that does not parse is dropped.
+fn zone_keys(rrs: [dnsrr.DnsRr]) -> [dnskey.Dnskey]
+    var out: [dnskey.Dnskey] = []
+    for r in rrs
+        if r.rtype == dnsrr.RR_TYPE_DNSKEY
+            match dnskey.dnskey_parse(r.rdata)
+                Err(_) =>
+                    out = out
+                Ok(k)  =>
+                    if dnskey.is_zone_key(k) and not dnskey.is_revoked(k)
+                        out = list.push(out, k)
+    out
+
+// The RRSIG records of `rrsigs` that cover `rtype` and that parse.
+fn signatures_for(rrsigs: [dnsrr.DnsRr], rtype: Int) -> [dnsrrsig.Rrsig]
+    var out: [dnsrrsig.Rrsig] = []
+    for r in rrsigs
+        if r.rtype == dnsrr.RR_TYPE_RRSIG
+            match dnsrrsig.rrsig_parse(r.rdata)
+                Err(_) =>
+                    out = out
+                Ok(s)  =>
+                    if s.type_covered == rtype
+                        out = list.push(out, s)
+    out
+
+// ── An RRset against the keys of its zone ───────────────────────────
+
+// Check an RRset against its signatures with `keys`, the keys of the zone
+// that signs it, at `now`. Secure when one signature verifies. Bogus when
+// there are signatures and none does. Indeterminate when every signature
+// uses an algorithm this package does not verify. An RRset with no
+// signature is bogus: the caller has established that the zone is signed.
+pub fn validate_rrset(keys: [dnskey.Dnskey], rrset: [dnsrr.DnsRr], rrsigs: [dnsrr.DnsRr],
+                      now: Int) -> Validation
+    if list.len(rrset) == 0
+        return outcome(STATE_INDETERMINATE, REASON_NO_CHAIN, dns_codec.root_name(), 0)
+    let sigs = signatures_for(rrsigs, rrset[0].rtype)
+    if list.len(sigs) == 0
+        return outcome(STATE_BOGUS, REASON_NO_SIGNATURE, rrset[0].name, 0)
+    var detail = dnsrrsig.VERDICT_KEY_MISMATCH
+    var supported = false
+    for s in sigs
+        if algorithm_supported(s.algorithm)
+            supported = true
+        for k in keys
+            let v = dnsrrsig.verify(k, s, rrset, now)
+            if v == dnsrrsig.VERDICT_OK
+                return Validation { state: STATE_SECURE,
+                    reason: REASON_NONE,
+                    zone: s.signer,
+                    detail: dnsrrsig.VERDICT_OK,
+                    keys: keys }
+            if v != dnsrrsig.VERDICT_KEY_MISMATCH
+                detail = v
+    if not supported
+        outcome(STATE_INDETERMINATE, REASON_ALGORITHM, rrset[0].name, dnsrrsig.VERDICT_ALGORITHM)
+    else
+        outcome(STATE_BOGUS, REASON_SIGNATURE_FAILED, rrset[0].name, detail)
+
+// ── The chain of keys ───────────────────────────────────────────────
+
+// What the caller supplies for one zone cut: the zone's name, its DNSKEY
+// RRset with the RRSIG records that cover it, and, for every zone but the
+// first, the DS RRset the parent holds for it with the RRSIG records that
+// cover that. `ds_absent` says the caller has authenticated a proof that
+// the parent has no DS record for the zone (`dnsnsec.nsec_denial` or
+// `dnsnsec.nsec3_denial` answered `DENIAL_NO_DS` or `DENIAL_OPT_OUT` for
+// RRsets already validated), which makes the zone insecure.
+pub struct ZoneLink
+    zone: dns_codec.DnsName
+    dnskeys: [dnsrr.DnsRr]
+    dnskey_sigs: [dnsrr.DnsRr]
+    ds: [dnsrr.DnsRr]
+    ds_sigs: [dnsrr.DnsRr]
+    ds_absent: Bool
+
+// The DS records of `rrs` that parse.
+fn parse_ds(rrs: [dnsrr.DnsRr]) -> [dnskey.Ds]
+    var out: [dnskey.Ds] = []
+    for r in rrs
+        if r.rtype == dnsrr.RR_TYPE_DS
+            match dnskey.ds_parse(r.rdata)
+                Err(_) =>
+                    out = out
+                Ok(d)  =>
+                    out = list.push(out, d)
+    out
+
+// The DS records among `anchors` that this package can use: a supported
+// algorithm and a digest type it computes.
+fn usable(anchors: [dnskey.Ds]) -> [dnskey.Ds]
+    var out: [dnskey.Ds] = []
+    for d in anchors
+        if algorithm_supported(d.algorithm) and dnskey.ds_digest_supported(d.digest_type)
+            out = list.push(out, d)
+    out
+
+// The DNSKEYs of the link's zone that some DS of `anchors` names: the
+// entry points of the zone.
+fn entry_keys(link: ZoneLink, anchors: [dnskey.Ds]) -> [dnskey.Dnskey]
+    var out: [dnskey.Dnskey] = []
+    for r in link.dnskeys
+        if r.rtype == dnsrr.RR_TYPE_DNSKEY
+            match dnskey.dnskey_parse(r.rdata)
+                Err(_) =>
+                    out = out
+                Ok(k)  =>
+                    if dnskey.is_zone_key(k) and not dnskey.is_revoked(k)
+                        for d in anchors
+                            if dnskey.ds_matches(d, link.zone, r.rdata)
+                                out = list.push(out, k)
+    out
+
+// The keys of a link once they are authenticated: the entry keys must
+// have signed the DNSKEY RRset (RFC 4035 section 5.2). Returns the
+// validation of the link's DNSKEY RRset.
+fn link_keys(link: ZoneLink, anchors: [dnskey.Ds], now: Int) -> Validation
+    let entries = entry_keys(link, anchors)
+    if list.len(entries) == 0
+        return outcome(STATE_BOGUS, REASON_NO_KEY_FOR_DS, link.zone, 0)
+    var set: [dnsrr.DnsRr] = []
+    for r in link.dnskeys
+        if r.rtype == dnsrr.RR_TYPE_DNSKEY
+            set = list.push(set, r)
+    let checked = validate_rrset(entries, set, link.dnskey_sigs, now)
+    if checked.state == STATE_SECURE
+        Validation { state: STATE_SECURE,
+            reason: REASON_NONE,
+            zone: link.zone,
+            detail: dnsrrsig.VERDICT_OK,
+            keys: zone_keys(set) }
+    else
+        outcome(STATE_BOGUS, REASON_DNSKEY_NOT_SIGNED, link.zone, checked.detail)
+
+// Validate the keys of the zone at the end of a chain.
+//
+// `anchors` are DS records for the first link's zone: the root's, for a
+// chain from the root (`root_trust_anchor`). Each later link's zone must
+// be below the one before; its DS RRset is checked against the keys of
+// the link before, and its DNSKEY RRset against the DS. The answer is
+// secure with the keys of the last zone, insecure when a zone has no DS or
+// only unsupported ones, bogus when something supplied does not check, and
+// indeterminate when the links or the anchors are missing.
+pub fn validate_chain(anchors: [dnskey.Ds], links: [ZoneLink], now: Int) -> Validation
+    if list.len(links) == 0
+        return outcome(STATE_INDETERMINATE, REASON_NO_CHAIN, dns_codec.root_name(), 0)
+    if list.len(anchors) == 0
+        return outcome(STATE_INDETERMINATE, REASON_NO_ANCHOR, links[0].zone, 0)
+    let first_usable = usable(anchors)
+    if list.len(first_usable) == 0
+        return outcome(STATE_INSECURE, REASON_UNSUPPORTED, links[0].zone, 0)
+    var current = link_keys(links[0], first_usable, now)
+    if current.state != STATE_SECURE
+        return current
+    for i in 1..list.len(links)
+        let link = links[i]
+        let parent = links[i - 1]
+        if not dnsrr.is_below(link.zone, parent.zone)
+            return outcome(STATE_BOGUS, REASON_OUT_OF_ORDER, link.zone, 0)
+        if link.ds_absent
+            return outcome(STATE_INSECURE, REASON_DS_ABSENT, link.zone, 0)
+        if list.len(link.ds) == 0
+            return outcome(STATE_INDETERMINATE, REASON_NO_DS, link.zone, 0)
+        let ds_check = validate_rrset(current.keys, link.ds, link.ds_sigs, now)
+        if ds_check.state != STATE_SECURE
+            return outcome(STATE_BOGUS, REASON_DS_NOT_SIGNED, link.zone, ds_check.detail)
+        let ds_usable = usable(parse_ds(link.ds))
+        if list.len(ds_usable) == 0
+            return outcome(STATE_INSECURE, REASON_UNSUPPORTED, link.zone, 0)
+        current = link_keys(link, ds_usable, now)
+        if current.state != STATE_SECURE
+            return current
+    current
+
+// Validate an answer: the chain of keys to the zone that signs `rrset`,
+// and then the RRset itself against that zone's keys. The signer of the
+// RRset's signature must be the zone the chain ends at, and the RRset's
+// owner must be at or below it.
+pub fn validate_answer(anchors: [dnskey.Ds], links: [ZoneLink], rrset: [dnsrr.DnsRr],
+                       rrsigs: [dnsrr.DnsRr], now: Int) -> Validation
+    let chain = validate_chain(anchors, links, now)
+    if chain.state != STATE_SECURE
+        return chain
+    if list.len(rrset) == 0 or not dnsrr.is_at_or_below(rrset[0].name, chain.zone)
+        return outcome(STATE_INDETERMINATE, REASON_NO_CHAIN, chain.zone, 0)
+    for s in signatures_for(rrsigs, rrset[0].rtype)
+        if not dns_codec.name_eq(s.signer, chain.zone)
+            return outcome(STATE_BOGUS, REASON_WRONG_SIGNER, chain.zone, 0)
+    validate_rrset(chain.keys, rrset, rrsigs, now)

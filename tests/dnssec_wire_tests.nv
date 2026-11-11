@@ -1,0 +1,763 @@
+// dnssec_wire_tests.nv — the records of DNSSEC as bytes: the key tag, the
+// DS digest, the DNSKEY and RRSIG fields, the canonical order of names and
+// of records, and the type bitmap.
+//
+// Every key, digest and tag below is an example the RFCs print, copied from
+// their text.  Where an RFC gives a key and the tag or the DS that goes with
+// it, the test computes the tag and the digest and compares them to the
+// RFC's:
+//
+//   RFC 4034 section 5.4     dskey.example.com., tag 60485, a SHA-1 DS
+//   RFC 4034 section 3.3     an RRSIG for host.example.com.
+//   RFC 4034 section 4.3     the NSEC and its bitmap with TYPE1234
+//   RFC 4034 section 6.1     the canonical order of nine names
+//   RFC 4035 appendix A      the keys of example., tags 38519 and 9465
+//   RFC 6605 section 6       example.net., ECDSA P-256 tag 55648, P-384 tag 10771
+//   RFC 8080 section 6       example.com., Ed25519 tags 3613 and 35217, Ed448
+//                            tags 9713 and 38353
+//   IANA root-anchors.xml    the key-signing key KSK-2024, tag 38696
+
+use std.test
+use std.bytes
+use std.str
+use dns_codec
+use dnsrr
+use dnskey
+use dnsrrsig
+use dnsnsec
+use dnsvalid
+
+// The bytes of base64 text.
+fn b64(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_base64(text) ?? bytes.zeros(0))
+
+// The bytes of hexadecimal text.
+fn hexb(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(text) ?? bytes.zeros(0))
+
+// A name from presentation text.
+fn nm(text: Str) -> dns_codec.DnsName
+    dnsrr.name_text(text)
+
+// The RDATA of a DNSKEY: flags, protocol 3, algorithm and the key given
+// as base64.
+fn dk(flags: Int, alg: Int, key_b64: Str) -> [u8]
+    dnsrr.cat([((flags >> 8) & 255) as u8, (flags & 255) as u8, 3 as u8, alg as u8], b64(key_b64))
+
+// The hexadecimal text of bytes.
+fn hx(b: [u8]) -> Str
+    bytes.to_hex(bytes.from_byte_list(b))
+
+// ── Vectors copied from the RFCs ────────────────────────────────────
+
+fn rfc4034_dskey() -> Str
+    "AQOeiiR0GOMYkDshWoSKz9XzfwJr1AYtsmx3TGkJaNXVbfi/2pHm822aJ5iI9BMz" + "NXxeYCmZDRD99WYwYqUSdjMmmAphXdvxegXd/M5+X7OrzKBaMbCVdFLUUh6DhweJ" + "BjEVv5f2wwjM9XzcnOf+EPbtG9DMBmADjFDc2w/rljwvFw=="
+
+fn rfc4034_rrsig() -> Str
+    "oJB1W6WNGv+ldvQ3WDG0MQkg5IEhjRip8WTrPYGv07h108dUKGMeDPKijVCHX3DD" + "Kdfb+v6oB9wfuh3DTJXUAfI/M0zmO/zz8bW0Rznl8O3tGNazPwQKkRN20XPXV6nw" + "wfoXmJQbsLNrLfkGJ5D6fwFm8nN+6pBzeDQfsS3Ap3o="
+
+fn rfc4035_zsk() -> Str
+    "AQOy1bZVvpPqhg4j7EJoM9rI3ZmyEx2OzDBVrZy/lvI5CQePxXHZS4i8dANH4DX3" + "tbHol61ek8EFMcsGXxKciJFHyhl94C+NwILQdzsUlSFovBZsyl/NX6yEbtw/xN9Z" + "NcrbYvgjjZ/UVPZIySFNsgEYvh0z2542lzMKR4Dh8uZffQ=="
+
+fn rfc4035_ksk() -> Str
+    "AQOeX7+baTmvpVHb2CcLnL1dMRWbuscRvHXlLnXwDzvqp4tZVKp1sZMepFb8Mvxh" + "hW3y/0QZsyCjczGJ1qk8vJe52iOhInKROVLRwxGpMfzPRLMlGybr51bOV/1se0OD" + "acj3DomyB4QB5gKTYot/K9alk5/j8vfd4jWCWD+E1Sze0Q=="
+
+fn rfc6605_p256_key() -> Str
+    "GojIhhXUN/u4v54ZQqGSnyhWJwaubCvTmeexv7bR6edbkrSqQpF64cYbcB7wNcP+" + "e+MAnLr+Wi9xMWyQLc8NAA=="
+
+fn rfc6605_p256_sig() -> Str
+    "qx6wLYqmh+l9oCKTN6qIc+bw6ya+KJ8oMz0YP107epXAyGmt+3SNruPFKG7tZoLB" + "LlUzGGus7ZwmwWep666VCw=="
+
+fn rfc6605_p384_key() -> Str
+    "xKYaNhWdGOfJ+nPrL8/arkwf2EY3MDJ+SErKivBVSum1w/egsXvSADtNJhyem5RC" + "OpgQ6K8X1DRSEkrbYQ+OB+v8/uX45NBwY8rp65F6Glur8I/mlVNgF6W/qTI37m40"
+
+fn rfc8080_ed25519_1_key() -> Str
+    "l02Woi0iS8Aa25FQkUd9RMzZHJpBoRQwAQEX1SxZJA4="
+
+fn rfc8080_ed25519_2_key() -> Str
+    "zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs="
+
+fn rfc8080_ed25519_1_sig() -> Str
+    "Edk+IB9KNNWg0HAjm7FazXyrd5m3Rk8zNZbvNpAcM+eysqcUOMIjWoevFkjH5GaM" + "WeG96GUVZu6ECKOQmemHDg=="
+
+fn rfc8080_ed25519_2_sig() -> Str
+    "5LL2obmzdqjWI+Xto5eP5adXt/T5tMhasWvwcyW4L3SzfcRawOle9bodhC+oip9a" + "yUGjY9T/rL4rN3bOuESGDA=="
+
+fn rfc8080_ed448_1_key() -> Str
+    "3kgROaDjrh0H2iuixWBrc8g2EpBBLCdGzHmn+G2MpTPhpj/OiBVHHSfPodx1FYYU" + "cJKm1MDpJtIA"
+
+fn rfc8080_ed448_2_key() -> Str
+    "kkreGWoccSDmUBGAe7+zsbG6ZAFQp+syPmYUurBRQc3tDjeMCJcVMRDmgcNLp5Hl" + "HAMy12VoISsA"
+
+fn root_ksk_2024() -> Str
+    "AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyG" + "wCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8" + "e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/" + "dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGO" + "HOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2" + "vaF18UYH9Z9GNUUeayffKC73PYc="
+
+// ── The key tag and the DS ──────────────────────────────────────────
+
+@test
+fn test_the_key_tags_are_the_ones_the_rfcs_print() [io]
+    test.case("RFC 4034 section 5.4: key id 60485")
+    test.assert_eq(dnskey.key_tag(dk(256, 5, rfc4034_dskey())), 60485)
+    test.case("RFC 4035 appendix A: the RRSIGs name 38519 and 9465")
+    test.assert_eq(dnskey.key_tag(dk(256, 5, rfc4035_zsk())), 38519)
+    test.assert_eq(dnskey.key_tag(dk(257, 5, rfc4035_ksk())), 9465)
+    test.case("RFC 6605 section 6: P-256 55648, P-384 10771")
+    test.assert_eq(dnskey.key_tag(dk(257, 13, rfc6605_p256_key())), 55648)
+    test.assert_eq(dnskey.key_tag(dk(257, 14, rfc6605_p384_key())), 10771)
+    test.case("RFC 8080 section 6: Ed25519 3613 and 35217, Ed448 9713 and 38353")
+    test.assert_eq(dnskey.key_tag(dk(257, 15, rfc8080_ed25519_1_key())), 3613)
+    test.assert_eq(dnskey.key_tag(dk(257, 15, rfc8080_ed25519_2_key())), 35217)
+    test.assert_eq(dnskey.key_tag(dk(257, 16, rfc8080_ed448_1_key())), 9713)
+    test.assert_eq(dnskey.key_tag(dk(257, 16, rfc8080_ed448_2_key())), 38353)
+    test.case("the root's KSK-2024 in the IANA trust anchor file: 38696")
+    test.assert_eq(dnskey.key_tag(dk(257, 8, root_ksk_2024())), 38696)
+
+@test
+fn test_algorithm_1_takes_its_tag_from_the_modulus() [io]
+    // RFC 4034 appendix B.1: the key tag of RSA/MD5 is the least significant
+    // 16 bits of the most significant 24 bits of the modulus, which are the
+    // two bytes before the last one of the RDATA.
+    let rd = hexb("0100030101010101ab12cd34")
+    test.assert_eq(dnskey.key_tag(rd), 0x12cd)
+    test.assert_eq(dnskey.key_tag([]), 0)
+    test.assert_eq(dnskey.key_tag([1 as u8, 2 as u8]), 0x0102 + 0)
+
+@test
+fn test_the_ds_digests_are_the_ones_the_rfcs_print() [io]
+    test.case("RFC 4034 section 5.4: SHA-1 over dskey.example.com. and the DNSKEY")
+    let key = dk(256, 5, rfc4034_dskey())
+    test.assert_eq(hx(dnskey.ds_digest(nm("dskey.example.com."), key, 1)),
+        "2bb183af5f22588179a53b0a98631fad1a292118")
+    test.case("the owner name is folded to lower case before it is hashed")
+    test.assert_eq(hx(dnskey.ds_digest(nm("DSKEY.Example.COM."), key, 1)),
+        "2bb183af5f22588179a53b0a98631fad1a292118")
+    test.case("RFC 6605: SHA-256 for P-256 and SHA-384 (digest type 4) for P-384")
+    test.assert_eq(hx(dnskey.ds_digest(nm("example.net."), dk(257, 13, rfc6605_p256_key()), 2)),
+        "b4c8c1fe2e7477127b27115656ad6256f424625bf5c1e2770ce6d6e37df61d17")
+    test.assert_eq(hx(dnskey.ds_digest(nm("example.net."), dk(257, 14, rfc6605_p384_key()), 4)),
+        "72d7b62976ce06438e9c0bf319013cf801f09ecc84b8d7e9495f27e305c6a9b0563a9b5f4d288405c3008a946df983d6")
+    test.case("RFC 8080: the four SHA-256 DS records")
+    test.assert_eq(hx(dnskey.ds_digest(nm("example.com."), dk(257, 15, rfc8080_ed25519_1_key()), 2)),
+        "3aa5ab37efce57f737fc1627013fee07bdf241bd10f3b1964ab55c78e79a304b")
+    test.assert_eq(hx(dnskey.ds_digest(nm("example.com."), dk(257, 15, rfc8080_ed25519_2_key()), 2)),
+        "401781b934e392de492ec77ae2e15d70f6575a1c0bc59c5275c04ebe80c6614c")
+    test.assert_eq(hx(dnskey.ds_digest(nm("example.com."), dk(257, 16, rfc8080_ed448_1_key()), 2)),
+        "6ccf18d5bc5d7fc2fceb1d59d17321402f2aa8d368048db93dd811f5cb2b19c7")
+    test.assert_eq(hx(dnskey.ds_digest(nm("example.com."), dk(257, 16, rfc8080_ed448_2_key()), 2)),
+        "645ff078b3568f5852b70cb60e8e696cc77b75bfaaffc118cf79cbda1ba28af4")
+    test.case("the root's KSK-2024 against the DS the IANA publishes")
+    test.assert_eq(hx(dnskey.ds_digest(nm("."), dk(257, 8, root_ksk_2024()), 2)),
+        "683d2d0acb8c9b712a1948b27f741219298d0a450d612c483af444a4c0fb2b16")
+    test.case("a digest type this package does not compute is empty")
+    test.assert_eq(list.len(dnskey.ds_digest(nm("example.com."), key, 3)), 0)
+    test.assert_eq(list.len(dnskey.ds_digest(nm("example.com."), key, 0)), 0)
+
+@test
+fn test_a_ds_record_matches_its_dnskey_and_no_other() [io]
+    let key = dk(256, 5, rfc4034_dskey())
+    let ds = dnskey.Ds { key_tag: 60485,
+        algorithm: 5,
+        digest_type: 1,
+        digest: hexb("2bb183af5f22588179a53b0a98631fad1a292118") }
+    test.assert_eq(dnskey.ds_matches(ds, nm("dskey.example.com."), key), true)
+    test.assert_eq(dnskey.ds_matches(ds, nm("DSKEY.EXAMPLE.COM."), key), true)
+    test.case("another owner name")
+    test.assert_eq(dnskey.ds_matches(ds, nm("other.example.com."), key), false)
+    test.case("another key tag, another algorithm, another digest")
+    test.assert_eq(dnskey.ds_matches(dnskey.Ds { key_tag: 60486, algorithm: 5, digest_type: 1, digest: ds.digest },
+        nm("dskey.example.com."),
+        key),
+    false)
+    test.assert_eq(dnskey.ds_matches(dnskey.Ds { key_tag: 60485, algorithm: 7, digest_type: 1, digest: ds.digest },
+        nm("dskey.example.com."),
+        key),
+    false)
+    test.assert_eq(dnskey.ds_matches(dnskey.Ds { key_tag: 60485,
+        algorithm: 5,
+        digest_type: 1,
+        digest: hexb("2bb183af5f22588179a53b0a98631fad1a292119") },
+    nm("dskey.example.com."), key),
+    false)
+    test.assert_eq(dnskey.ds_matches(dnskey.Ds { key_tag: 60485, algorithm: 5, digest_type: 1, digest: hexb("2bb183af") },
+        nm("dskey.example.com."),
+        key),
+    false)
+    test.case("a digest type that is not computed never matches, and a short DNSKEY never does")
+    test.assert_eq(dnskey.ds_matches(dnskey.Ds { key_tag: 60485, algorithm: 5, digest_type: 3, digest: hexb("00") },
+        nm("dskey.example.com."),
+        key),
+    false)
+    test.assert_eq(dnskey.ds_matches(ds, nm("dskey.example.com."), [1 as u8, 2 as u8]), false)
+
+@test
+fn test_a_ds_is_made_from_a_dnskey_and_read_back() [io]
+    let key = dk(257, 13, rfc6605_p256_key())
+    let ds = dnskey.ds_of_dnskey(nm("example.net."), key, 2)
+    test.assert_eq(ds.key_tag, 55648)
+    test.assert_eq(ds.algorithm, 13)
+    test.assert_eq(ds.digest_type, 2)
+    test.assert_eq(hx(ds.digest), "b4c8c1fe2e7477127b27115656ad6256f424625bf5c1e2770ce6d6e37df61d17")
+    let rd = dnskey.ds_rdata(ds)
+    test.assert_eq(list.len(rd), 4 + 32)
+    match dnskey.ds_parse(rd)
+        Ok(back) =>
+            test.assert_eq(back.key_tag, 55648)
+            test.assert_eq(back.digest_type, 2)
+            test.assert_eq(dnskey.ds_matches(back, nm("example.net."), key), true)
+        Err(_)   => test.assert_eq(true, false)
+    test.assert_eq(dnskey.ds_digest_length(1), 20)
+    test.assert_eq(dnskey.ds_digest_length(2), 32)
+    test.assert_eq(dnskey.ds_digest_length(3), 0)
+    test.assert_eq(dnskey.ds_digest_length(4), 48)
+    test.assert_eq(dnskey.ds_digest_supported(4), true)
+    test.assert_eq(dnskey.ds_digest_supported(3), false)
+
+@test
+fn test_the_root_trust_anchor_names_the_published_ksk_2024() [io]
+    let anchor = dnsvalid.root_trust_anchor()
+    test.assert_eq(anchor.key_tag, 38696)
+    test.assert_eq(anchor.algorithm, 8)
+    test.assert_eq(anchor.digest_type, 2)
+    test.assert_eq(hx(anchor.digest), "683d2d0acb8c9b712a1948b27f741219298d0a450d612c483af444a4c0fb2b16")
+    test.case("and it is the DS of the key in the IANA file")
+    test.assert_eq(dnskey.ds_matches(anchor, nm("."), dk(257, 8, root_ksk_2024())), true)
+    test.assert_eq(dnskey.ds_matches(anchor, nm("example."), dk(257, 8, root_ksk_2024())), false)
+
+// ── The DNSKEY ──────────────────────────────────────────────────────
+
+@test
+fn test_a_dnskey_is_read_and_written() [io]
+    let rd = dk(257, 13, rfc6605_p256_key())
+    match dnskey.dnskey_parse(rd)
+        Ok(k)  =>
+            test.assert_eq(k.flags, 257)
+            test.assert_eq(k.protocol, 3)
+            test.assert_eq(k.algorithm, 13)
+            test.assert_eq(list.len(k.key), 64)
+            test.assert_eq(dnskey.is_zone_key(k), true)
+            test.assert_eq(dnskey.is_sep(k), true)
+            test.assert_eq(dnskey.is_revoked(k), false)
+            test.assert_eq(hx(dnskey.dnskey_rdata(k)), hx(rd))
+        Err(_) => test.assert_eq(true, false)
+    test.case("the flags of the ZSK of RFC 4035 appendix A: zone key, not a secure entry point")
+    match dnskey.dnskey_parse(dk(256, 5, rfc4035_zsk()))
+        Ok(z)  =>
+            test.assert_eq(dnskey.is_zone_key(z), true)
+            test.assert_eq(dnskey.is_sep(z), false)
+        Err(_) => test.assert_eq(true, false)
+    test.case("a revoked key (RFC 5011) and a key with no zone bit")
+    match dnskey.dnskey_parse(dk(0x0181, 8, root_ksk_2024()))
+        Ok(r)  => test.assert_eq(dnskey.is_revoked(r), true)
+        Err(_) => test.assert_eq(true, false)
+    match dnskey.dnskey_parse(dk(1, 8, root_ksk_2024()))
+        Ok(n)  => test.assert_eq(dnskey.is_zone_key(n), false)
+        Err(_) => test.assert_eq(true, false)
+
+@test
+fn test_a_malformed_dnskey_is_refused_with_the_reason() [io]
+    match dnskey.dnskey_parse([1 as u8, 1 as u8, 3 as u8])
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the RDATA is 3 bytes, and the record needs 4")
+    match dnskey.dnskey_parse([1 as u8, 1 as u8, 4 as u8, 8 as u8, 9 as u8])
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the DNSKEY protocol is 4, not 3")
+    match dnskey.dnskey_parse([1 as u8, 1 as u8, 3 as u8, 8 as u8])
+        Ok(k)  => test.assert_eq(list.len(k.key), 0)
+        Err(_) => test.assert_eq(true, false)
+
+@test
+fn test_the_public_key_lengths() [io]
+    test.assert_eq(dnskey.key_length_fits(13, 64), true)
+    test.assert_eq(dnskey.key_length_fits(13, 63), false)
+    test.assert_eq(dnskey.key_length_fits(14, 96), true)
+    test.assert_eq(dnskey.key_length_fits(14, 64), false)
+    test.assert_eq(dnskey.key_length_fits(15, 32), true)
+    test.assert_eq(dnskey.key_length_fits(15, 31), false)
+    test.assert_eq(dnskey.key_length_fits(16, 57), true)
+    test.assert_eq(dnskey.key_length_fits(16, 32), false)
+    test.assert_eq(dnskey.key_length_fits(8, 5), true)
+    test.case("the published keys have those lengths")
+    test.assert_eq(list.len(b64(rfc6605_p256_key())), 64)
+    test.assert_eq(list.len(b64(rfc6605_p384_key())), 96)
+    test.assert_eq(list.len(b64(rfc8080_ed25519_1_key())), 32)
+    test.assert_eq(list.len(b64(rfc8080_ed448_1_key())), 57)
+
+// Whether `key` splits into an exponent and a modulus.
+fn rsa_ok(key: [u8]) -> Bool
+    match dnskey.rsa_key_parts(key)
+        Ok(_)  => true
+        Err(_) => false
+
+@test
+fn test_an_rsa_public_key_is_split_into_exponent_and_modulus() [io]
+    test.case("RFC 4034 section 5.4: an exponent of one byte, 3, and a 1024-bit modulus")
+    match dnskey.rsa_key_parts(b64(rfc4034_dskey()))
+        Ok(p)  =>
+            test.assert_eq(hx(p.exponent), "03")
+            test.assert_eq(list.len(p.modulus), 128)
+            test.assert_eq(p.modulus[0] as Int, 0x9e)
+        Err(_) => test.assert_eq(true, false)
+    test.case("the root's key: exponent 65537, modulus of 256 bytes")
+    match dnskey.rsa_key_parts(b64(root_ksk_2024()))
+        Ok(r)  =>
+            test.assert_eq(hx(r.exponent), "010001")
+            test.assert_eq(list.len(r.modulus), 256)
+        Err(_) => test.assert_eq(true, false)
+    test.case("the three-byte form of the exponent length (RFC 3110 section 2)")
+    let long = dnsrr.cat([0 as u8, 0 as u8, 4 as u8, 1 as u8, 0 as u8, 0 as u8, 1 as u8], [7 as u8, 8 as u8, 9 as u8])
+    match dnskey.rsa_key_parts(long)
+        Ok(l)  =>
+            test.assert_eq(hx(l.exponent), "01000001")
+            test.assert_eq(hx(l.modulus), "070809")
+        Err(_) => test.assert_eq(true, false)
+    test.case("a key too short, with no modulus, or with a length of zero is refused")
+    test.assert_eq(rsa_ok([1 as u8, 3 as u8]), false)
+    test.assert_eq(rsa_ok([2 as u8, 1 as u8, 3 as u8]), false)
+    test.assert_eq(rsa_ok([0 as u8, 0 as u8, 0 as u8, 5 as u8]), false)
+    test.assert_eq(rsa_ok([1 as u8, 3 as u8, 5 as u8]), true)
+
+@test
+fn test_cds_and_cdnskey_delete_records() [io]
+    test.case("RFC 8078 section 4: CDS 0 0 0 00 and CDNSKEY 0 3 0 AA==")
+    match dnskey.ds_parse([0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8])
+        Ok(d)  => test.assert_eq(dnskey.ds_is_delete(d), true)
+        Err(_) => test.assert_eq(true, false)
+    match dnskey.dnskey_parse([0 as u8, 0 as u8, 3 as u8, 0 as u8, 0 as u8])
+        Ok(k)  => test.assert_eq(dnskey.dnskey_is_delete(k), true)
+        Err(_) => test.assert_eq(true, false)
+    test.case("an ordinary CDS and CDNSKEY are read as a DS and a DNSKEY")
+    match dnskey.ds_parse(hexb("97a8080200112233"))
+        Ok(d)  =>
+            test.assert_eq(dnskey.ds_is_delete(d), false)
+            test.assert_eq(d.key_tag, 0x97a8)
+            test.assert_eq(d.digest_type, 2)
+        Err(_) => test.assert_eq(true, false)
+    match dnskey.dnskey_parse(dk(257, 15, rfc8080_ed25519_1_key()))
+        Ok(k)  => test.assert_eq(dnskey.dnskey_is_delete(k), false)
+        Err(_) => test.assert_eq(true, false)
+    test.case("a DS shorter than five bytes is refused")
+    match dnskey.ds_parse([1 as u8, 2 as u8, 3 as u8, 4 as u8])
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the RDATA is 4 bytes, and the record needs 5")
+
+// ── The RRSIG ───────────────────────────────────────────────────────
+
+// The RDATA of the RRSIG of RFC 4034 section 3.3, for host.example.com. A:
+// type A (1), algorithm 5, 3 labels, original TTL 86400, expiration
+// 20030322173103 (1048354263), inception 20030220173103 (1045762263), key
+// tag 2642, signer example.com.
+fn rfc4034_rrsig_rdata() -> [u8]
+    var head: [u8] = [0 as u8, 1 as u8, 5 as u8, 3 as u8, 0 as u8, 1 as u8, 81 as u8, 128 as u8]
+    head = dnsrr.cat(head, [0x3E as u8, 0x7C as u8, 0x9D as u8, 0xD7 as u8])
+    head = dnsrr.cat(head, [0x3E as u8, 0x55 as u8, 0x10 as u8, 0xD7 as u8])
+    head = dnsrr.cat(head, [0x0A as u8, 0x52 as u8])
+    head = dnsrr.cat(head, nm("example.com.").wire)
+    dnsrr.cat(head, b64(rfc4034_rrsig()))
+
+@test
+fn test_the_rrsig_of_rfc_4034_section_3_3_is_read_field_by_field() [io]
+    match dnsrrsig.rrsig_parse(rfc4034_rrsig_rdata())
+        Err(_) => test.assert_eq(true, false)
+        Ok(s)  =>
+            test.assert_eq(s.type_covered, 1)
+            test.assert_eq(s.algorithm, 5)
+            test.assert_eq(s.labels, 3)
+            test.assert_eq(s.original_ttl, 86400)
+            test.assert_eq(s.expiration, 1048354263)
+            test.assert_eq(s.inception, 1045762263)
+            test.assert_eq(s.key_tag, 2642)
+            test.assert_eq(dns_codec.name_text(s.signer), "example.com.")
+            test.assert_eq(list.len(s.signature), 128)
+
+            test.case("the RDATA is written back as it was, and the prefix is its first 18 + 13 bytes")
+            test.assert_eq(hx(dnsrrsig.rrsig_rdata(s)), hx(rfc4034_rrsig_rdata()))
+            test.assert_eq(list.len(dnsrrsig.rrsig_prefix(s)), 18 + 13)
+
+            test.case("the signature was valid from its inception to its expiration, both included")
+            test.assert_eq(dnsrrsig.rrsig_valid_at(s, 1045762262), false)
+            test.assert_eq(dnsrrsig.rrsig_valid_at(s, 1045762263), true)
+            test.assert_eq(dnsrrsig.rrsig_valid_at(s, 1048354263), true)
+            test.assert_eq(dnsrrsig.rrsig_valid_at(s, 1048354264), false)
+
+@test
+fn test_a_malformed_rrsig_is_refused_with_the_reason() [io]
+    let good = rfc4034_rrsig_rdata()
+    match dnsrrsig.rrsig_parse(list.slice(good, 0, 18))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the RDATA is 18 bytes, and the record needs 19")
+    test.case("a signer's name that is compressed")
+    var comp = list.clone(good)
+    comp[18] = 0xC0 as u8
+    match dnsrrsig.rrsig_parse(comp)
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: a name in the RDATA is compressed or has no end")
+    test.case("a signer's name with no signature after it")
+    match dnsrrsig.rrsig_parse(list.slice(good, 0, 18 + 13))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the RDATA is 31 bytes, and the record needs 32")
+    test.case("a signer's name that never ends")
+    match dnsrrsig.rrsig_parse(list.slice(good, 0, 24))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: a name in the RDATA is compressed or has no end")
+
+@test
+fn test_signature_times_compare_as_serial_numbers() [io]
+    test.assert_eq(dnsrrsig.serial_lte(1, 2), true)
+    test.assert_eq(dnsrrsig.serial_lte(2, 2), true)
+    test.assert_eq(dnsrrsig.serial_lte(3, 2), false)
+    test.case("RFC 1982: 2^32 - 1 is before 5, because the difference is under 2^31")
+    test.assert_eq(dnsrrsig.serial_lte(4294967295, 5), true)
+    test.assert_eq(dnsrrsig.serial_lte(5, 4294967295), false)
+    test.case("a difference of exactly 2^31 is not 'before' in either direction")
+    test.assert_eq(dnsrrsig.serial_lte(0, 2147483648), false)
+    test.assert_eq(dnsrrsig.serial_lte(2147483648, 0), false)
+    test.assert_eq(dnsrrsig.serial_lte(0, 2147483647), true)
+    test.case("a window that spans the wrap: inception 4294967000, expiration 1000")
+    match dnsrrsig.rrsig_parse(rfc4034_rrsig_rdata())
+        Err(_) => test.assert_eq(true, false)
+        Ok(s)  =>
+            let w = dnsrrsig.Rrsig { type_covered: 1,
+                algorithm: 5,
+                labels: 3,
+                original_ttl: 1,
+                expiration: 1000,
+                inception: 4294967000,
+                key_tag: 1,
+                signer: s.signer,
+                signature: s.signature }
+            test.assert_eq(dnsrrsig.rrsig_valid_at(w, 4294967100), true)
+            test.assert_eq(dnsrrsig.rrsig_valid_at(w, 500), true)
+            test.assert_eq(dnsrrsig.rrsig_valid_at(w, 2000), false)
+            test.assert_eq(dnsrrsig.rrsig_valid_at(w, 4294966000), false)
+            test.case("the time is taken modulo 2^32")
+            test.assert_eq(dnsrrsig.rrsig_valid_at(w, 4294967100 + 4294967296), true)
+
+// ── Names and records in canonical form ─────────────────────────────
+
+@test
+fn test_names_sort_in_the_canonical_order_of_rfc_4034_section_6_1() [io]
+    let names = ["example.",
+        "a.example.",
+        "yljkjljk.a.example.",
+        "Z.a.example.",
+        "zABC.a.EXAMPLE.",
+        "z.example.",
+        "\\001.z.example.",
+        "*.z.example.",
+        "\\200.z.example."]
+    for i in 0..9
+        for j in 0..9
+            let c = dnsrr.name_cmp(nm(names[i]), nm(names[j]))
+            if i < j
+                test.assert_eq(c, -1)
+            elif i == j
+                test.assert_eq(c, 0)
+            else
+                test.assert_eq(c, 1)
+
+@test
+fn test_name_helpers() [io]
+    test.assert_eq(dnsrr.name_cmp(nm("EXAMPLE.com."), nm("example.COM.")), 0)
+    test.assert_eq(dnsrr.is_at_or_below(nm("a.b.example."), nm("example.")), true)
+    test.assert_eq(dnsrr.is_at_or_below(nm("EXAMPLE."), nm("example.")), true)
+    test.assert_eq(dnsrr.is_at_or_below(nm("example."), nm("a.example.")), false)
+    test.assert_eq(dnsrr.is_at_or_below(nm("badexample."), nm("example.")), false)
+    test.assert_eq(dnsrr.is_at_or_below(nm("anything."), nm(".")), true)
+    test.assert_eq(dnsrr.is_below(nm("example."), nm("example.")), false)
+    test.assert_eq(dnsrr.is_below(nm("a.example."), nm("example.")), true)
+    test.assert_eq(dnsrr.name_same(nm("A.Example."), nm("a.example.")), true)
+    test.assert_eq(dns_codec.name_text(dnsrr.parent_name(nm("a.b.example."))), "b.example.")
+    test.assert_eq(dns_codec.name_text(dnsrr.parent_name(nm("example."))), ".")
+    test.assert_eq(dns_codec.name_text(dnsrr.parent_name(nm("."))), ".")
+    test.assert_eq(dns_codec.name_text(dnsrr.name_suffix(nm("a.b.example."), 2)), "b.example.")
+    test.assert_eq(dns_codec.name_text(dnsrr.name_suffix(nm("a.b.example."), 0)), ".")
+    test.assert_eq(dns_codec.name_text(dnsrr.name_suffix(nm("a.b.example."), 9)), "a.b.example.")
+    test.assert_eq(dns_codec.name_text(dnsrr.wildcard_below(nm("w.example."))), "*.w.example.")
+    test.assert_eq(dnsrr.is_wildcard(nm("*.w.example.")), true)
+    test.assert_eq(dnsrr.is_wildcard(nm("w.example.")), false)
+    test.assert_eq(dnsrr.is_wildcard(nm(".")), false)
+    test.case("the Labels field counts neither the root nor a leading wildcard")
+    test.assert_eq(dnsrr.label_count_for_rrsig(nm("www.example.com.")), 3)
+    test.assert_eq(dnsrr.label_count_for_rrsig(nm("*.example.com.")), 2)
+    test.assert_eq(dnsrr.label_count_for_rrsig(nm(".")), 0)
+    test.assert_eq(hx(dnsrr.lower_wire(nm("AbC.Z.").wire)), "03616263017a00")
+
+@test
+fn test_names_inside_rdata_are_folded_by_type_as_rfc_6840_says() [io]
+    test.case("MX: the preference stays and the exchange is folded")
+    let mx = dnsrr.cat([0 as u8, 10 as u8], nm("MaIl.EXAMPLE.").wire)
+    test.assert_eq(hx(dnsrr.canonical_rdata(15, mx)), "000a046d61696c076578616d706c6500")
+    test.case("NS and CNAME: the whole RDATA is a name")
+    test.assert_eq(hx(dnsrr.canonical_rdata(2, nm("NS1.Example.").wire)), "036e7331076578616d706c6500")
+    test.assert_eq(hx(dnsrr.canonical_rdata(5, nm("NS1.Example.").wire)), "036e7331076578616d706c6500")
+    test.case("SOA: two names are folded and the five numbers are not, even when a byte of one is a capital letter")
+    let soa = dnsrr.cat(dnsrr.cat(nm("NS1.Example.").wire, nm("Bugs.Example.").wire),
+        hexb("41424344" + "00000e10" + "0000012c" + "0036ee80" + "00000e10"))
+    test.assert_eq(hx(dnsrr.canonical_rdata(6, soa)),
+        "036e7331076578616d706c6500" + "0462756773076578616d706c6500" + "41424344" + "00000e10" + "0000012c" + "0036ee80" + "00000e10")
+    test.case("SRV: priority, weight and port stay, the target is folded")
+    let srv = dnsrr.cat(hexb("0041004200ff"), nm("Host.Example.").wire)
+    test.assert_eq(hx(dnsrr.canonical_rdata(33, srv)), "0041004200ff" + "04686f7374076578616d706c6500")
+    test.case("RRSIG: the signer's name is folded and the signature stays")
+    let sig = dnsrr.cat(dnsrr.cat(hexb("000108" + "03" + "00000e10" + "00000002" + "00000001" + "412a"), nm("Z.EXAMPLE.").wire),
+        hexb("4142"))
+    test.assert_eq(hx(dnsrr.canonical_rdata(46, sig)),
+        "000108" + "03" + "00000e10" + "00000002" + "00000001" + "412a" + "017a076578616d706c6500" + "4142")
+    test.case("NSEC: the next domain name is not folded (RFC 6840 section 5.1)")
+    let nsec = dnsrr.cat(nm("Next.EXAMPLE.").wire, hexb("000106400100000003"))
+    test.assert_eq(hx(dnsrr.canonical_rdata(47, nsec)), hx(nsec))
+    test.case("HINFO, A, TXT and a type that is not known are left as they are")
+    test.assert_eq(hx(dnsrr.canonical_rdata(13, hexb("064b4c482d3130034954530041"))),
+        "064b4c482d3130034954530041")
+    test.assert_eq(hx(dnsrr.canonical_rdata(1, [192 as u8, 0 as u8, 2 as u8, 65 as u8])), "c000024" + "1")
+    test.assert_eq(hx(dnsrr.canonical_rdata(65500, hexb("41424344"))), "41424344")
+    test.case("NAPTR: three character-strings are skipped and the replacement is folded")
+    let naptr = dnsrr.cat(hexb("00640032" + "0155" + "03455831" + "00"), nm("Mail.Example.").wire)
+    test.assert_eq(hx(dnsrr.canonical_rdata(35, naptr)),
+        "00640032" + "0155" + "03455831" + "00" + "046d61696c076578616d706c6500")
+    test.case("a name cut off by the end of the RDATA is folded as far as it goes")
+    test.assert_eq(hx(dnsrr.canonical_rdata(2, hexb("034142"))), "036162")
+    test.assert_eq(hx(dnsrr.canonical_rdata(2, hexb("41"))), "61")
+    test.assert_eq(hx(dnsrr.canonical_rdata(15, hexb("00"))), "00")
+    test.assert_eq(hx(dnsrr.canonical_rdata(35, hexb("0064"))), "0064")
+
+@test
+fn test_an_rrset_is_sorted_by_rdata_and_duplicates_are_dropped() [io]
+    let owner = nm("host.example.")
+    let a = dnsrr.rr(owner, 1, 1, 300, [10 as u8, 0 as u8, 0 as u8, 2 as u8])
+    let b = dnsrr.rr(owner, 1, 1, 300, [10 as u8, 0 as u8, 0 as u8, 1 as u8])
+    let c = dnsrr.rr(owner, 1, 1, 300, [9 as u8, 255 as u8, 255 as u8, 255 as u8])
+    let dup = dnsrr.rr(owner, 1, 1, 600, [10 as u8, 0 as u8, 0 as u8, 1 as u8])
+    let sorted = dnsrr.rrset_rdata_sorted([a, b, c, dup])
+    test.assert_eq(list.len(sorted), 3)
+    test.assert_eq(hx(sorted[0]), "09ffffff")
+    test.assert_eq(hx(sorted[1]), "0a000001")
+    test.assert_eq(hx(sorted[2]), "0a000002")
+    test.case("the canonical wire form: owner, type, class, the TTL given, length, RDATA, record after record")
+    let wire = dnsrr.rrset_canonical_wire(dnsrr.name_wire(owner), 1, 1, 3600, [a, b])
+    test.assert_eq(hx(wire),
+        "04686f7374076578616d706c6500" + "0001" + "0001" + "00000e10" + "0004" + "0a000001" + "04686f7374076578616d706c6500" + "0001" + "0001" + "00000e10" + "0004" + "0a000002")
+    test.case("a shorter RDATA that is a prefix of a longer one sorts first")
+    test.assert_eq(dnsrr.bytes_cmp([1 as u8, 2 as u8], [1 as u8, 2 as u8, 0 as u8]), -1)
+    test.assert_eq(dnsrr.bytes_cmp([1 as u8, 2 as u8, 0 as u8], [1 as u8, 2 as u8]), 1)
+    test.assert_eq(dnsrr.bytes_cmp([], []), 0)
+    test.assert_eq(dnsrr.bytes_cmp([255 as u8], [0 as u8]), 1)
+    test.case("records are selected by owner, type and class")
+    let other = dnsrr.rr(nm("other.example."), 1, 1, 300, [1 as u8, 1 as u8, 1 as u8, 1 as u8])
+    let txt = dnsrr.rr(owner, 16, 1, 300, [0 as u8])
+    let sel = dnsrr.rrset_of([a, other, txt, b], nm("HOST.example."), 1, 1)
+    test.assert_eq(list.len(sel), 2)
+    test.assert_eq(list.len(dnsrr.rrset_of([a, other, txt, b], owner, 1, 3)), 0)
+
+@test
+fn test_a_codec_record_becomes_a_record_of_this_package() [io]
+    let name = nm("www.example.")
+    let a = dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 300,
+        data: dns_codec.RdataA([192 as u8, 0 as u8, 2 as u8, 1 as u8]) }
+    let r = dnsrr.rr_of_record(a)
+    test.assert_eq(r.rtype, 1)
+    test.assert_eq(r.rclass, 1)
+    test.assert_eq(r.ttl, 300)
+    test.assert_eq(hx(r.rdata), "c0000201")
+    test.case("MX, NS, CNAME, PTR, AAAA, TXT, SRV, SOA and a record the codec leaves as bytes")
+    let mx = dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 1,
+        data: dns_codec.RdataMx(dns_codec.DnsMx { preference: 10, exchange: nm("mail.example.") }) })
+    test.assert_eq(mx.rtype, 15)
+    test.assert_eq(hx(mx.rdata), "000a046d61696c076578616d706c6500")
+    test.assert_eq(dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 1,
+        data: dns_codec.RdataNs(nm("ns.example.")) }).rtype,
+    2)
+    test.assert_eq(dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 1,
+        data: dns_codec.RdataCname(nm("ns.example.")) }).rtype,
+    5)
+    test.assert_eq(dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 1,
+        data: dns_codec.RdataPtr(nm("ns.example.")) }).rtype,
+    12)
+    test.assert_eq(dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 1,
+        data: dns_codec.RdataAaaa(hexb("20010db8000000000000000000000001")) }).rtype,
+    28)
+    let txt = dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 1,
+        data: dns_codec.RdataTxt([hexb("6162"), hexb("63")]) })
+    test.assert_eq(txt.rtype, 16)
+    test.assert_eq(hx(txt.rdata), "02616201" + "63")
+    let srv = dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 1,
+        data: dns_codec.RdataSrv(dns_codec.DnsSrv { priority: 1, weight: 2, port: 80, target: nm("h.example.") }) })
+    test.assert_eq(srv.rtype, 33)
+    test.assert_eq(hx(srv.rdata), "000100020050" + "0168076578616d706c6500")
+    let soa = dnsrr.rr_of_record(dns_codec.DnsRecord { name: name, record_class: dns_codec.DnsClassInternet, ttl: 1, data: dns_codec.RdataSoa(dns_codec.DnsSoa { primary: nm("a."),
+        mailbox: nm("b."),
+        serial: 1,
+        refresh: 2,
+        retry: 3,
+        expire: 4,
+        minimum: 5 }) })
+    test.assert_eq(soa.rtype, 6)
+    test.assert_eq(hx(soa.rdata),
+        "016100" + "016200" + "00000001" + "00000002" + "00000003" + "00000004" + "00000005")
+    let opt = dnsrr.rr_of_record(dns_codec.DnsRecord { name: nm("."),
+        record_class: dns_codec.DnsClassOther(1232),
+        ttl: 0,
+        data: dns_codec.RdataOpt([dns_codec.DnsOption { code: 10, data: hexb("0102") }]) })
+    test.assert_eq(opt.rtype, 41)
+    test.assert_eq(hx(opt.rdata), "000a00020102")
+    let unk = dnsrr.rr_of_record(dns_codec.DnsRecord { name: name,
+        record_class: dns_codec.DnsClassInternet,
+        ttl: 7,
+        data: dns_codec.RdataUnknown(48, hexb("0101030f")) })
+    test.assert_eq(unk.rtype, 48)
+    test.assert_eq(hx(unk.rdata), "0101030f")
+
+// ── Type bitmaps and NSEC ───────────────────────────────────────────
+
+@test
+fn test_the_nsec_example_of_rfc_4034_section_4_3() [io]
+    // alfa.example.com. 86400 IN NSEC host.example.com. A MX RRSIG NSEC TYPE1234
+    let rd = hexb("04686f7374076578616d706c6503636f6d00" + "0006400100000003" + "041b" + "00".repeat(26) + "20")
+    test.assert_eq(list.len(rd), 18 + 8 + 2 + 27)
+    match dnsnsec.nsec_parse(rd)
+        Err(_) => test.assert_eq(true, false)
+        Ok(n)  =>
+            test.assert_eq(dns_codec.name_text(n.next), "host.example.com.")
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 1), true)
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 15), true)
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 46), true)
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 47), true)
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 1234), true)
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 28), false)
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 1233), false)
+            test.assert_eq(dnsnsec.bitmap_has(n.bitmap, 5000), false)
+            match dnsnsec.bitmap_types(n.bitmap)
+                Ok(ts) =>
+                    test.assert_eq(list.len(ts), 5)
+                    test.assert_eq(ts[0], 1)
+                    test.assert_eq(ts[4], 1234)
+                Err(_) => test.assert_eq(true, false)
+    test.case("the writer builds the same bytes")
+    test.assert_eq(hx(dnsnsec.nsec_rdata(nm("host.example.com."), [1, 15, 46, 47, 1234])), hx(rd))
+    test.assert_eq(hx(dnsnsec.nsec_rdata(nm("host.example.com."), [1234, 47, 1, 46, 15])), hx(rd))
+
+@test
+fn test_a_malformed_bitmap_is_refused() [io]
+    test.case("windows out of order")
+    test.assert_eq(dnsnsec.bitmap_is_valid(hexb("010140" + "000140")), false)
+    test.case("a length of zero, or over 32")
+    test.assert_eq(dnsnsec.bitmap_is_valid(hexb("0000")), false)
+    test.assert_eq(dnsnsec.bitmap_is_valid(hexb("0021" + "00".repeat(33))), false)
+    test.case("a window that runs past the end, and a header with no length")
+    test.assert_eq(dnsnsec.bitmap_is_valid(hexb("000240")), false)
+    test.assert_eq(dnsnsec.bitmap_is_valid(hexb("00")), false)
+    test.case("an empty bitmap and a good one")
+    test.assert_eq(dnsnsec.bitmap_is_valid([]), true)
+    test.assert_eq(dnsnsec.bitmap_is_valid(hexb("000140")), true)
+    test.case("a bitmap that is malformed after the type asked for is read as far as it goes")
+    test.assert_eq(dnsnsec.bitmap_has(hexb("00014000"), 1), true)
+    test.assert_eq(dnsnsec.bitmap_has(hexb("0001400021"), 2), false)
+    match dnsnsec.nsec_parse(dnsrr.cat(nm("a.").wire, hexb("0000")))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the type bitmap is malformed")
+    match dnsnsec.nsec_parse(hexb("0161"))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: a name in the RDATA is compressed or has no end")
+
+@test
+fn test_the_bitmap_encoder_makes_windows_in_order() [io]
+    test.assert_eq(hx(dnsnsec.bitmap_encode([])), "")
+    test.assert_eq(hx(dnsnsec.bitmap_encode([1])), "000140")
+    test.assert_eq(hx(dnsnsec.bitmap_encode([0])), "000180")
+    test.assert_eq(hx(dnsnsec.bitmap_encode([255])), "0020" + "00".repeat(31) + "01")
+    test.assert_eq(hx(dnsnsec.bitmap_encode([256])), "010180")
+    test.assert_eq(hx(dnsnsec.bitmap_encode([1, 256, 65535])),
+        "000140" + "010180" + "ff20" + "00".repeat(31) + "01")
+    match dnsnsec.bitmap_types(dnsnsec.bitmap_encode([2, 46, 47, 300, 44000]))
+        Ok(ts) =>
+            test.assert_eq(list.len(ts), 5)
+            test.assert_eq(ts[3], 300)
+            test.assert_eq(ts[4], 44000)
+        Err(_) => test.assert_eq(true, false)
+
+@test
+fn test_every_kind_of_error_has_its_words() [io]
+    match dnskey.dnskey_parse([1 as u8])
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: the RDATA is 1 bytes, and the record needs 4")
+    match dnskey.rsa_key_parts([1 as u8, 3 as u8])
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: algorithm 8 has no public key of 2 bytes")
+
+@test
+fn test_a_name_that_is_too_long_is_refused_where_a_name_is_read() [io]
+    // Five labels of 63 bytes make a name of 321 bytes, over the 255 of RFC 1035.
+    let label = dnsrr.cat([63 as u8], hexb("61".repeat(63)))
+    var long: [u8] = []
+    for _ in 0..5
+        long = dnsrr.cat(long, label)
+    long = dnsrr.cat(long, [0 as u8])
+    match dnsnsec.nsec_parse(dnsrr.cat(long, hexb("000140")))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: a name in the RDATA is compressed or has no end")
+    let head = hexb("000108" + "03" + "00000e10" + "00000002" + "00000001" + "412a")
+    match dnsrrsig.rrsig_parse(dnsrr.cat(dnsrr.cat(head, long), hexb("4142")))
+        Ok(_)  => test.assert_eq(true, false)
+        Err(e) => test.assert_eq(e.message(), "dnssec: a name in the RDATA is compressed or has no end")
+
+@test
+fn test_text_and_labels_that_make_no_name_make_the_root() [io]
+    test.assert_eq(dns_codec.name_text(dnsrr.name_text("a..b")), ".")
+    test.assert_eq(dns_codec.name_text(dnsrr.name_text("")), ".")
+    let empty: [u8] = []
+    test.assert_eq(dns_codec.name_text(dnsrr.name_of([empty])), ".")
+    test.assert_eq(dns_codec.name_text(dnsrr.name_of([hexb("6162")])), "ab.")
+
+@test
+fn test_a_bitmap_that_is_malformed_in_its_first_window_has_no_types() [io]
+    test.assert_eq(dnsnsec.bitmap_has(hexb("0000"), 1), false)
+    test.assert_eq(dnsnsec.bitmap_has(hexb("0021" + "00".repeat(33)), 1), false)
+    test.assert_eq(dnsnsec.bitmap_has(hexb("00"), 1), false)
+
+@test
+fn test_the_names_in_every_listed_type_are_folded() [io]
+    let name = nm("Ab.CD.").wire
+    let lowered = hx(dnsrr.lower_wire(name))
+    test.case("types whose whole RDATA is a name: MD, MF, MB, MG, MR, PTR, DNAME")
+    for t in [3, 4, 7, 8, 9, 12, 39]
+        test.assert_eq(hx(dnsrr.canonical_rdata(t, name)), lowered)
+    test.case("MINFO and RP: two names")
+    for t in [14, 17]
+        test.assert_eq(hx(dnsrr.canonical_rdata(t, dnsrr.cat(name, name))), lowered + lowered)
+    test.case("AFSDB, RT and KX: a preference and a name")
+    for t in [18, 21, 36]
+        test.assert_eq(hx(dnsrr.canonical_rdata(t, dnsrr.cat(hexb("4142"), name))), "4142" + lowered)
+    test.case("PX: a preference and two names")
+    test.assert_eq(hx(dnsrr.canonical_rdata(26, dnsrr.cat(dnsrr.cat(hexb("4142"), name), name))),
+        "4142" + lowered + lowered)
+    test.case("NXT: a name and the bitmap after it, which is not folded")
+    test.assert_eq(hx(dnsrr.canonical_rdata(30, dnsrr.cat(name, hexb("4142")))), lowered + "4142")
+    test.case("SIG: 18 bytes, a name, and the signature")
+    test.assert_eq(hx(dnsrr.canonical_rdata(24, dnsrr.cat(dnsrr.cat(hexb("41".repeat(18)), name), hexb("4142")))),
+        "41".repeat(18) + lowered + "4142")
+    test.case("bytes after what the shape accounts for are carried as they are")
+    test.assert_eq(hx(dnsrr.canonical_rdata(15, dnsrr.cat(dnsrr.cat(hexb("4142"), name), hexb("4344")))),
+        "4142" + lowered + "4344")
+
+@test
+fn test_one_record_in_canonical_wire_form_is_owner_type_class_ttl_length_and_rdata() [io]
+    // a.example. A IN 3600 192.0.2.1
+    let owner = nm("a.example.").wire
+    test.assert_eq(hx(dnsrr.rr_canonical_wire(owner, 1, 1, 3600, hexb("c0000201"))),
+        "0161" + "07" + "6578616d706c65" + "00" + "0001" + "0001" + "00000e10" + "0004" + "c0000201")

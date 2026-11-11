@@ -1,0 +1,263 @@
+// dnskey.nv — the DNSKEY, DS, CDS and CDNSKEY records (RFC 4034 sections
+// 2 and 5, RFC 7344): the fields, the key tag of appendix B, the public
+// key forms of RFC 3110 (RSA), RFC 6605 (ECDSA) and RFC 8080 (EdDSA), and
+// the digest a DS record holds, computed over the owner name and the
+// DNSKEY RDATA (RFC 4034 section 5.1.4, RFC 4509, RFC 6605 section 4).
+//
+// RDATA is a `[u8]`, the wire bytes of the record.  A reader answers a
+// `Result` with a `DnssecError` that says what is wrong with the bytes.
+//
+// Nothing in this module performs input or output or reads a clock.
+
+use std.bytes
+use hashing
+use dns_codec
+use dnsrr
+
+// ── Numbers ─────────────────────────────────────────────────────────
+
+// The Zone Key bit of the DNSKEY flags: the key may sign the zone's
+// RRsets (RFC 4034 section 2.1.1).
+pub const DNSKEY_FLAG_ZONE = 0x0100
+// The Secure Entry Point bit: the key is a key-signing key by
+// convention (RFC 3757).
+pub const DNSKEY_FLAG_SEP = 0x0001
+// The Revoke bit (RFC 5011): the key is no longer to be trusted.
+pub const DNSKEY_FLAG_REVOKE = 0x0080
+
+// The protocol field of every DNSKEY (section 2.1.2).
+pub const DNSKEY_PROTOCOL = 3
+
+// RSA/SHA-1 (algorithm 5), RSASHA1-NSEC3-SHA1 (7), RSA/SHA-256 (8),
+// RSA/SHA-512 (10), ECDSA P-256 with SHA-256 (13), ECDSA P-384 with
+// SHA-384 (14), Ed25519 (15) and Ed448 (16).
+pub const ALG_RSASHA1 = 5
+// RSASHA1-NSEC3-SHA1.
+pub const ALG_RSASHA1_NSEC3 = 7
+// RSA/SHA-256.
+pub const ALG_RSASHA256 = 8
+// RSA/SHA-512.
+pub const ALG_RSASHA512 = 10
+// ECDSA P-256 with SHA-256.
+pub const ALG_ECDSAP256SHA256 = 13
+// ECDSA P-384 with SHA-384.
+pub const ALG_ECDSAP384SHA384 = 14
+// Ed25519.
+pub const ALG_ED25519 = 15
+// Ed448.
+pub const ALG_ED448 = 16
+
+// The digest types of a DS record: SHA-1 (RFC 4034), SHA-256 (RFC 4509),
+// GOST R 34.11-94 (RFC 5933) and SHA-384 (RFC 6605).
+pub const DS_DIGEST_SHA1 = 1
+// SHA-256.
+pub const DS_DIGEST_SHA256 = 2
+// GOST R 34.11-94, which is not implemented.
+pub const DS_DIGEST_GOST = 3
+// SHA-384.
+pub const DS_DIGEST_SHA384 = 4
+
+// ── Errors ──────────────────────────────────────────────────────────
+
+// Why bytes are not a record of the type asked for.
+pub enum DnssecError
+    // The RDATA is shorter than the fixed part of the record needs.
+    DnssecTruncated(got: Int, need: Int)
+    // A DNSKEY protocol other than 3.
+    DnssecBadProtocol(got: Int)
+    // A name in the RDATA that is not uncompressed, or has no end.
+    DnssecBadName
+    // A public key whose length does not fit its algorithm.
+    DnssecBadKey(algorithm: Int, length: Int)
+    // An NSEC or NSEC3 type bitmap that does not follow RFC 4034 section
+    // 4.1.2.
+    DnssecBadBitmap
+    // An NSEC3 record with an unknown hash algorithm or a bad hash length.
+    DnssecBadNsec3
+
+impl Error for DnssecError
+    fn message(self) -> Str
+        match self
+            DnssecTruncated(got, need) => "dnssec: the RDATA is ${got} bytes, and the record needs ${need}"
+            DnssecBadProtocol(got)     => "dnssec: the DNSKEY protocol is ${got}, not 3"
+            DnssecBadName              => "dnssec: a name in the RDATA is compressed or has no end"
+            DnssecBadKey(a, n)         => "dnssec: algorithm ${a} has no public key of ${n} bytes"
+            DnssecBadBitmap            => "dnssec: the type bitmap is malformed"
+            DnssecBadNsec3             => "dnssec: the NSEC3 record is malformed"
+
+// ── The DNSKEY ──────────────────────────────────────────────────────
+
+// A DNSKEY record's RDATA read into fields.
+pub struct Dnskey
+    flags: Int
+    protocol: Int
+    algorithm: Int
+    key: [u8]
+
+// Read the RDATA of a DNSKEY or CDNSKEY record.  The protocol must be 3.
+pub fn dnskey_parse(rdata: [u8]) -> Result<Dnskey, DnssecError>
+    if list.len(rdata) < 4
+        return Err(DnssecTruncated(list.len(rdata), 4))
+    let protocol = rdata[2] as Int
+    if protocol != DNSKEY_PROTOCOL
+        return Err(DnssecBadProtocol(protocol))
+    Ok(Dnskey { flags: (rdata[0] as Int << 8) | rdata[1] as Int,
+        protocol: protocol,
+        algorithm: rdata[3] as Int,
+        key: list.slice(rdata, 4, list.len(rdata)) })
+
+// The RDATA of a DNSKEY.
+pub fn dnskey_rdata(k: Dnskey) -> [u8]
+    dnsrr.cat([((k.flags >> 8) & 255) as u8, (k.flags & 255) as u8, k.protocol as u8, k.algorithm as u8],
+        k.key)
+
+// Whether the Zone Key bit is set.
+pub fn is_zone_key(k: Dnskey) -> Bool
+    (k.flags & DNSKEY_FLAG_ZONE) != 0
+
+// Whether the Secure Entry Point bit is set.
+pub fn is_sep(k: Dnskey) -> Bool
+    (k.flags & DNSKEY_FLAG_SEP) != 0
+
+// Whether the Revoke bit is set.
+pub fn is_revoked(k: Dnskey) -> Bool
+    (k.flags & DNSKEY_FLAG_REVOKE) != 0
+
+// The key tag of a DNSKEY, from its RDATA (RFC 4034 appendix B).  For the
+// obsolete algorithm 1 it is the next-to-last two bytes, as appendix B.1
+// says; for every other it is the 16-bit sum of the RDATA with its carry
+// folded in.
+pub fn key_tag(rdata: [u8]) -> Int
+    let n = list.len(rdata)
+    if n >= 4 and (rdata[3] as Int) == 1
+        return (rdata[n - 3] as Int << 8) | rdata[n - 2] as Int
+    var ac = 0
+    for i in 0..n
+        if i % 2 == 0
+            ac = ac + (rdata[i] as Int << 8)
+        else
+            ac = ac + rdata[i] as Int
+    ac = ac + ((ac >> 16) & 0xFFFF)
+    ac & 0xFFFF
+
+// ── Public key forms ────────────────────────────────────────────────
+
+// The exponent and modulus of an RSA public key, each the bytes of a
+// big-endian number (RFC 3110 section 2).
+pub struct RsaKeyParts
+    exponent: [u8]
+    modulus: [u8]
+
+// The parts of an RSA public key: the first byte is the length of the
+// exponent, or zero and the next two bytes are; the exponent follows and
+// the modulus is the rest.
+pub fn rsa_key_parts(key: [u8]) -> Result<RsaKeyParts, DnssecError>
+    if list.len(key) < 3
+        return Err(DnssecBadKey(ALG_RSASHA256, list.len(key)))
+    var elen = key[0] as Int
+    var at = 1
+    if elen == 0
+        elen = (key[1] as Int << 8) | key[2] as Int
+        at = 3
+    if elen == 0 or at + elen >= list.len(key)
+        return Err(DnssecBadKey(ALG_RSASHA256, list.len(key)))
+    Ok(RsaKeyParts { exponent: list.slice(key, at, at + elen),
+        modulus: list.slice(key, at + elen, list.len(key)) })
+
+// Whether the length of a public key suits its algorithm: 64 bytes for
+// ECDSA P-256, 96 for P-384, 32 for Ed25519, 57 for Ed448; an RSA key has
+// no fixed length and any other algorithm is not checked.
+pub fn key_length_fits(algorithm: Int, length: Int) -> Bool
+    if algorithm == ALG_ECDSAP256SHA256
+        length == 64
+    elif algorithm == ALG_ECDSAP384SHA384
+        length == 96
+    elif algorithm == ALG_ED25519
+        length == 32
+    elif algorithm == ALG_ED448
+        length == 57
+    else
+        true
+
+// ── The DS record ───────────────────────────────────────────────────
+
+// A DS or CDS record's RDATA read into fields.
+pub struct Ds
+    key_tag: Int
+    algorithm: Int
+    digest_type: Int
+    digest: [u8]
+
+// Read the RDATA of a DS or CDS record.
+pub fn ds_parse(rdata: [u8]) -> Result<Ds, DnssecError>
+    if list.len(rdata) < 5
+        return Err(DnssecTruncated(list.len(rdata), 5))
+    Ok(Ds { key_tag: (rdata[0] as Int << 8) | rdata[1] as Int,
+        algorithm: rdata[2] as Int,
+        digest_type: rdata[3] as Int,
+        digest: list.slice(rdata, 4, list.len(rdata)) })
+
+// The RDATA of a DS record.
+pub fn ds_rdata(d: Ds) -> [u8]
+    dnsrr.cat([((d.key_tag >> 8) & 255) as u8,
+        (d.key_tag & 255) as u8,
+        d.algorithm as u8,
+        d.digest_type as u8],
+    d.digest)
+
+// The length in bytes of the digest of a type, or 0 for one this package
+// does not compute.
+pub fn ds_digest_length(digest_type: Int) -> Int
+    if digest_type == DS_DIGEST_SHA1
+        20
+    elif digest_type == DS_DIGEST_SHA256
+        32
+    elif digest_type == DS_DIGEST_SHA384
+        48
+    else
+        0
+
+// Whether this package computes digests of this type.
+pub fn ds_digest_supported(digest_type: Int) -> Bool
+    ds_digest_length(digest_type) > 0
+
+// The digest of a DNSKEY for a DS record: the hash of the canonical
+// owner name followed by the DNSKEY RDATA (RFC 4034 section 5.1.4).  An
+// empty list for a digest type that is not computed.
+pub fn ds_digest(owner: dns_codec.DnsName, dnskey_rdata: [u8], digest_type: Int) -> [u8]
+    let input = bytes.from_byte_list(dnsrr.cat(dnsrr.name_wire(owner), dnskey_rdata))
+    if digest_type == DS_DIGEST_SHA1
+        bytes.to_byte_list(hashing.sha1(input))
+    elif digest_type == DS_DIGEST_SHA256
+        bytes.to_byte_list(hashing.sha256(input))
+    elif digest_type == DS_DIGEST_SHA384
+        bytes.to_byte_list(hashing.sha384(input))
+    else
+        []
+
+// A DS record for the DNSKEY at `owner` with RDATA `dnskey_rdata`, made
+// with the digest type `digest_type`.
+pub fn ds_of_dnskey(owner: dns_codec.DnsName, dnskey_rdata: [u8], digest_type: Int) -> Ds
+    Ds { key_tag: key_tag(dnskey_rdata),
+        algorithm: dnskey_rdata[3] as Int,
+        digest_type: digest_type,
+        digest: ds_digest(owner, dnskey_rdata, digest_type) }
+
+// Whether the DS record `d` is the DS of the DNSKEY at `owner` with the
+// RDATA `dnskey_rdata`: the same key tag and algorithm, and a digest that
+// is the one computed.  A digest type that is not computed never matches.
+pub fn ds_matches(d: Ds, owner: dns_codec.DnsName, dnskey_rdata: [u8]) -> Bool
+    if list.len(dnskey_rdata) < 4 or d.key_tag != key_tag(dnskey_rdata) or d.algorithm != (dnskey_rdata[3] as Int)
+        return false
+    let want = ds_digest(owner, dnskey_rdata, d.digest_type)
+    list.len(want) > 0 and dnsrr.bytes_cmp(want, d.digest) == 0
+
+// Whether a DS or CDS record is the "delete" record of RFC 8078 section 4:
+// key tag 0, algorithm 0, digest type 0 and a one-byte digest of zero.
+pub fn ds_is_delete(d: Ds) -> Bool
+    d.key_tag == 0 and d.algorithm == 0 and d.digest_type == 0 and list.len(d.digest) == 1 and (d.digest[0] as Int) == 0
+
+// Whether a DNSKEY or CDNSKEY record is the "delete" record of RFC 8078
+// section 4: flags 0, protocol 3, algorithm 0 and a one-byte key of zero.
+pub fn dnskey_is_delete(k: Dnskey) -> Bool
+    k.flags == 0 and k.protocol == DNSKEY_PROTOCOL and k.algorithm == 0 and list.len(k.key) == 1 and (k.key[0] as Int) == 0

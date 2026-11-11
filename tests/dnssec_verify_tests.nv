@@ -1,0 +1,444 @@
+// dnssec_verify_tests.nv — the check of a signature over an RRset: the
+// Ed25519 examples of RFC 8080, the ECDSA P-256 example of RFC 6605, the
+// data that was signed, the verdicts a check can give, and the algorithms
+// that are not verified.
+//
+// Every key and signature below is an example the RFCs print, copied from
+// their text. The RFC 8080 and RFC 6605 signatures are made by other
+// people's software over the canonical form of RFC 4034 section 6, so a
+// check that passes them has the canonical form right.
+
+use std.test
+use std.bytes
+use std.str
+use dns_codec
+use dnsrr
+use dnskey
+use dnsrrsig
+use dnsnsec
+use dnsvalid
+
+// The bytes of base64 text.
+fn b64(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_base64(text) ?? bytes.zeros(0))
+
+// The bytes of hexadecimal text.
+fn hexb(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(text) ?? bytes.zeros(0))
+
+// A name from presentation text.
+fn nm(text: Str) -> dns_codec.DnsName
+    dnsrr.name_text(text)
+
+// The RDATA of a DNSKEY: flags, protocol 3, algorithm and the key given
+// as base64.
+fn dk(flags: Int, alg: Int, key_b64: Str) -> [u8]
+    dnsrr.cat([((flags >> 8) & 255) as u8, (flags & 255) as u8, 3 as u8, alg as u8], b64(key_b64))
+
+// The hexadecimal text of bytes.
+fn hx(b: [u8]) -> Str
+    bytes.to_hex(bytes.from_byte_list(b))
+
+// ── Vectors copied from the RFCs ────────────────────────────────────
+
+fn rfc4034_dskey() -> Str
+    "AQOeiiR0GOMYkDshWoSKz9XzfwJr1AYtsmx3TGkJaNXVbfi/2pHm822aJ5iI9BMz" + "NXxeYCmZDRD99WYwYqUSdjMmmAphXdvxegXd/M5+X7OrzKBaMbCVdFLUUh6DhweJ" + "BjEVv5f2wwjM9XzcnOf+EPbtG9DMBmADjFDc2w/rljwvFw=="
+
+fn rfc4034_rrsig() -> Str
+    "oJB1W6WNGv+ldvQ3WDG0MQkg5IEhjRip8WTrPYGv07h108dUKGMeDPKijVCHX3DD" + "Kdfb+v6oB9wfuh3DTJXUAfI/M0zmO/zz8bW0Rznl8O3tGNazPwQKkRN20XPXV6nw" + "wfoXmJQbsLNrLfkGJ5D6fwFm8nN+6pBzeDQfsS3Ap3o="
+
+fn rfc4035_zsk() -> Str
+    "AQOy1bZVvpPqhg4j7EJoM9rI3ZmyEx2OzDBVrZy/lvI5CQePxXHZS4i8dANH4DX3" + "tbHol61ek8EFMcsGXxKciJFHyhl94C+NwILQdzsUlSFovBZsyl/NX6yEbtw/xN9Z" + "NcrbYvgjjZ/UVPZIySFNsgEYvh0z2542lzMKR4Dh8uZffQ=="
+
+fn rfc4035_ksk() -> Str
+    "AQOeX7+baTmvpVHb2CcLnL1dMRWbuscRvHXlLnXwDzvqp4tZVKp1sZMepFb8Mvxh" + "hW3y/0QZsyCjczGJ1qk8vJe52iOhInKROVLRwxGpMfzPRLMlGybr51bOV/1se0OD" + "acj3DomyB4QB5gKTYot/K9alk5/j8vfd4jWCWD+E1Sze0Q=="
+
+fn rfc6605_p256_key() -> Str
+    "GojIhhXUN/u4v54ZQqGSnyhWJwaubCvTmeexv7bR6edbkrSqQpF64cYbcB7wNcP+" + "e+MAnLr+Wi9xMWyQLc8NAA=="
+
+fn rfc6605_p256_sig() -> Str
+    "qx6wLYqmh+l9oCKTN6qIc+bw6ya+KJ8oMz0YP107epXAyGmt+3SNruPFKG7tZoLB" + "LlUzGGus7ZwmwWep666VCw=="
+
+fn rfc6605_p384_key() -> Str
+    "xKYaNhWdGOfJ+nPrL8/arkwf2EY3MDJ+SErKivBVSum1w/egsXvSADtNJhyem5RC" + "OpgQ6K8X1DRSEkrbYQ+OB+v8/uX45NBwY8rp65F6Glur8I/mlVNgF6W/qTI37m40"
+
+fn rfc8080_ed25519_1_key() -> Str
+    "l02Woi0iS8Aa25FQkUd9RMzZHJpBoRQwAQEX1SxZJA4="
+
+fn rfc8080_ed25519_2_key() -> Str
+    "zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs="
+
+fn rfc8080_ed25519_1_sig() -> Str
+    "Edk+IB9KNNWg0HAjm7FazXyrd5m3Rk8zNZbvNpAcM+eysqcUOMIjWoevFkjH5GaM" + "WeG96GUVZu6ECKOQmemHDg=="
+
+fn rfc8080_ed25519_2_sig() -> Str
+    "5LL2obmzdqjWI+Xto5eP5adXt/T5tMhasWvwcyW4L3SzfcRawOle9bodhC+oip9a" + "yUGjY9T/rL4rN3bOuESGDA=="
+
+fn rfc8080_ed448_1_key() -> Str
+    "3kgROaDjrh0H2iuixWBrc8g2EpBBLCdGzHmn+G2MpTPhpj/OiBVHHSfPodx1FYYU" + "cJKm1MDpJtIA"
+
+fn rfc8080_ed448_2_key() -> Str
+    "kkreGWoccSDmUBGAe7+zsbG6ZAFQp+syPmYUurBRQc3tDjeMCJcVMRDmgcNLp5Hl" + "HAMy12VoISsA"
+
+fn root_ksk_2024() -> Str
+    "AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyG" + "wCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8" + "e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/" + "dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGO" + "HOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2" + "vaF18UYH9Z9GNUUeayffKC73PYc="
+
+// A DNSKEY from its flags, algorithm and base64 key.
+fn key_of(flags: Int, alg: Int, key_b64: Str) -> dnskey.Dnskey
+    match dnskey.dnskey_parse(dk(flags, alg, key_b64))
+        Ok(k)  => k
+        Err(_) => dnskey.Dnskey { flags: 0, protocol: 3, algorithm: 0, key: [] }
+
+// An RRSIG record's fields; the signature is given as base64.
+fn sig_of(typ: Int, alg: Int, labels: Int, ttl: Int, exp: Int, inc: Int, tag: Int, signer: Str,
+          sig_b64: Str) -> dnsrrsig.Rrsig
+    dnsrrsig.Rrsig { type_covered: typ,
+        algorithm: alg,
+        labels: labels,
+        original_ttl: ttl,
+        expiration: exp,
+        inception: inc,
+        key_tag: tag,
+        signer: nm(signer),
+        signature: b64(sig_b64) }
+
+// The MX record of the RFC 8080 examples: example.com. MX 10 mail.example.com.
+fn mx_rr(owner: Str, pref: Int, exchange: Str) -> dnsrr.DnsRr
+    dnsrr.rr(nm(owner),
+        15,
+        1,
+        3600,
+        dnsrr.cat([((pref >> 8) & 255) as u8, (pref & 255) as u8], nm(exchange).wire))
+
+// The signature of the first Ed25519 example, as an RRSIG with the key tag 3613.
+fn ed1_sig() -> dnsrrsig.Rrsig
+    sig_of(15, 15, 2, 3600, 1440021600, 1438207200, 3613, "example.com.", rfc8080_ed25519_1_sig())
+
+// The signature of the second Ed25519 example, with the key tag 35217.
+fn ed2_sig() -> dnsrrsig.Rrsig
+    sig_of(15, 15, 2, 3600, 1440021600, 1438207200, 35217, "example.com.", rfc8080_ed25519_2_sig())
+
+// The two RRSIGs as the RFC made them.  Its text prints "RRSIG MX 3 3600" with
+// the algorithm missing, and the data the signatures cover was made with a
+// Labels field of 3, which is one more than the two labels of example.com.
+// (RFC 4035 section 5.3.1 makes such an RRSIG invalid).  `ed1_sig` and
+// `ed2_sig` above have the 2 that the owner has, for the tests that stop
+// before the cryptography.
+fn ed1_rfc_sig() -> dnsrrsig.Rrsig
+    sig_of(15, 15, 3, 3600, 1440021600, 1438207200, 3613, "example.com.", rfc8080_ed25519_1_sig())
+
+fn ed2_rfc_sig() -> dnsrrsig.Rrsig
+    sig_of(15, 15, 3, 3600, 1440021600, 1438207200, 35217, "example.com.", rfc8080_ed25519_2_sig())
+
+// ── RFC 8080: Ed25519 ───────────────────────────────────────────────
+
+@test
+fn test_the_two_ed25519_signatures_of_rfc_8080_verify() [io]
+    let rrset = [mx_rr("example.com.", 10, "mail.example.com.")]
+    let k1 = key_of(257, 15, rfc8080_ed25519_1_key())
+    let k2 = key_of(257, 15, rfc8080_ed25519_2_key())
+    test.assert_eq(dnsrrsig.verify_signature(k1, ed1_rfc_sig(), rrset), dnsrrsig.VERDICT_OK)
+    test.assert_eq(dnsrrsig.verify_signature(k2, ed2_rfc_sig(), rrset), dnsrrsig.VERDICT_OK)
+    test.case("with the Labels field the owner has, the data differs and the signatures do not verify")
+    test.assert_eq(dnsrrsig.verify_signature(k1, ed1_sig(), rrset), dnsrrsig.VERDICT_SIGNATURE)
+    test.assert_eq(dnsrrsig.verify_signature(k2, ed2_sig(), rrset), dnsrrsig.VERDICT_SIGNATURE)
+    test.case("a whole check refuses the RFC's RRSIG for its Labels field, which is above the owner's")
+    test.assert_eq(dnsrrsig.verify(k1, ed1_rfc_sig(), rrset, 1439000000), dnsrrsig.VERDICT_RRSET_MISMATCH)
+    test.case("the time checks come before the cryptography")
+    test.assert_eq(dnsrrsig.verify(k1, ed1_sig(), rrset, 1438207199), dnsrrsig.VERDICT_NOT_YET_VALID)
+    test.assert_eq(dnsrrsig.verify(k1, ed1_sig(), rrset, 1440021601), dnsrrsig.VERDICT_EXPIRED)
+    test.assert_eq(dnsrrsig.verify(k1, ed1_sig(), rrset, 1438207200), dnsrrsig.VERDICT_SIGNATURE)
+    test.assert_eq(dnsrrsig.verify(k1, ed1_sig(), rrset, 1440021600), dnsrrsig.VERDICT_SIGNATURE)
+
+@test
+fn test_the_data_that_was_signed_is_the_prefix_and_the_canonical_rrset() [io]
+    // RRSIG_RDATA without the signature: type 000f, algorithm 0f, labels 03,
+    // original TTL 3600, expiration 1440021600 (55d4fc60), inception 1438207200
+    // (55b94ce0), key tag 3613 (0e1d), signer example.com.; then the one record:
+    // example.com. MX class 1, TTL 3600, RDLENGTH 20, preference 10 and
+    // mail.example.com.
+    let data = dnsrrsig.signed_data(ed1_rfc_sig(), [mx_rr("example.com.", 10, "mail.example.com.")])
+    test.assert_eq(hx(data),
+        "000f0f0300000e1055d4fc6055b94ce00e1d076578616d706c6503636f6d00" + "076578616d706c6503636f6d00000f000100000e100014000a046d61696c076578616d706c6503636f6d00")
+    test.case("the case of the owner and of the name in the RDATA does not change what is signed")
+    let shown = dnsrrsig.signed_data(ed1_rfc_sig(), [mx_rr("EXAMPLE.Com.", 10, "MAIL.Example.COM.")])
+    test.assert_eq(hx(shown), hx(data))
+    test.case("the TTL of the record is replaced by the Original TTL of the signature")
+    let other_ttl = dnsrr.rr(nm("example.com."), 15, 1, 7, mx_rr("example.com.", 10, "mail.example.com.").rdata)
+    test.assert_eq(hx(dnsrrsig.signed_data(ed1_rfc_sig(), [other_ttl])), hx(data))
+    test.assert_eq(list.len(dnsrrsig.signed_data(ed1_rfc_sig(), [])), 0)
+
+@test
+fn test_what_was_signed_is_what_is_verified() [io]
+    let k1 = key_of(257, 15, rfc8080_ed25519_1_key())
+    test.case("another preference")
+    test.assert_eq(dnsrrsig.verify_signature(k1, ed1_rfc_sig(), [mx_rr("example.com.", 11, "mail.example.com.")]),
+        dnsrrsig.VERDICT_SIGNATURE)
+    test.case("another exchange")
+    test.assert_eq(dnsrrsig.verify_signature(k1, ed1_rfc_sig(), [mx_rr("example.com.", 10, "mail2.example.com.")]),
+        dnsrrsig.VERDICT_SIGNATURE)
+    test.case("another owner of the same label count")
+    test.assert_eq(dnsrrsig.verify_signature(k1, ed1_rfc_sig(), [mx_rr("example.org.", 10, "mail.example.com.")]),
+        dnsrrsig.VERDICT_SIGNATURE)
+    test.case("the same record in other letters, with another TTL, still verifies")
+    test.assert_eq(dnsrrsig.verify_signature(k1, ed1_rfc_sig(), [mx_rr("EXAMPLE.COM.", 10, "Mail.Example.Com.")]),
+        dnsrrsig.VERDICT_OK)
+    test.assert_eq(dnsrrsig.verify_signature(k1,
+        ed1_rfc_sig(),
+        [dnsrr.rr(nm("example.com."), 15, 1, 1, mx_rr("example.com.", 10, "mail.example.com.").rdata)]),
+    dnsrrsig.VERDICT_OK)
+    test.case("a second record in the set")
+    test.assert_eq(dnsrrsig.verify_signature(k1, ed1_rfc_sig(), [mx_rr("example.com.", 10, "mail.example.com."),
+        mx_rr("example.com.", 20, "mail2.example.com.")]),
+    dnsrrsig.VERDICT_SIGNATURE)
+    test.case("the same record twice is one record")
+    test.assert_eq(dnsrrsig.verify_signature(k1,
+        ed1_rfc_sig(),
+        [mx_rr("example.com.", 10, "mail.example.com."), mx_rr("example.com.", 10, "mail.example.com.")]),
+    dnsrrsig.VERDICT_OK)
+    test.case("a flipped bit in the signature")
+    var bad = list.clone(ed1_rfc_sig().signature)
+    bad[10] = (bad[10] as Int ^ 1) as u8
+    let flipped = dnsrrsig.Rrsig { type_covered: 15,
+        algorithm: 15,
+        labels: 3,
+        original_ttl: 3600,
+        expiration: 1440021600,
+        inception: 1438207200,
+        key_tag: 3613,
+        signer: nm("example.com."),
+        signature: bad }
+    test.assert_eq(dnsrrsig.verify_signature(k1, flipped, [mx_rr("example.com.", 10, "mail.example.com.")]),
+        dnsrrsig.VERDICT_SIGNATURE)
+    test.case("a signature of the wrong length")
+    let short = dnsrrsig.Rrsig { type_covered: 15,
+        algorithm: 15,
+        labels: 3,
+        original_ttl: 3600,
+        expiration: 1440021600,
+        inception: 1438207200,
+        key_tag: 3613,
+        signer: nm("example.com."),
+        signature: list.slice(bad, 0, 63) }
+    test.assert_eq(dnsrrsig.verify_signature(k1, short, [mx_rr("example.com.", 10, "mail.example.com.")]),
+        dnsrrsig.VERDICT_SIGNATURE)
+
+@test
+fn test_a_signature_is_checked_against_its_own_key_only() [io]
+    let rrset = [mx_rr("example.com.", 10, "mail.example.com.")]
+    let k1 = key_of(257, 15, rfc8080_ed25519_1_key())
+    let k2 = key_of(257, 15, rfc8080_ed25519_2_key())
+    test.assert_eq(dnsrrsig.verify(k2, ed1_sig(), rrset, 1439000000), dnsrrsig.VERDICT_KEY_MISMATCH)
+    test.assert_eq(dnsrrsig.verify(k1, ed2_sig(), rrset, 1439000000), dnsrrsig.VERDICT_KEY_MISMATCH)
+    test.case("the right tag but another key: the signature fails")
+    let forged = sig_of(15, 15, 3, 3600, 1440021600, 1438207200, 35217, "example.com.", rfc8080_ed25519_1_sig())
+    test.assert_eq(dnsrrsig.verify_signature(k2, forged, rrset), dnsrrsig.VERDICT_SIGNATURE)
+    test.case("the right key and tag, but another algorithm number in the signature")
+    let wrong_alg = sig_of(15, 13, 2, 3600, 1440021600, 1438207200, 3613, "example.com.", rfc8080_ed25519_1_sig())
+    test.assert_eq(dnsrrsig.verify(k1, wrong_alg, rrset, 1439000000), dnsrrsig.VERDICT_KEY_MISMATCH)
+
+@test
+fn test_a_key_that_is_not_a_zone_key_or_is_revoked_signs_nothing() [io]
+    let rrset = [mx_rr("example.com.", 10, "mail.example.com.")]
+    test.case("flags 1: no zone bit; the signature names the tag that key has")
+    let nz = key_of(1, 15, rfc8080_ed25519_1_key())
+    let tag_nz = dnskey.key_tag(dk(1, 15, rfc8080_ed25519_1_key()))
+    let s_nz = sig_of(15, 15, 2, 3600, 1440021600, 1438207200, tag_nz, "example.com.", rfc8080_ed25519_1_sig())
+    test.assert_eq(dnsrrsig.verify(nz, s_nz, rrset, 1439000000), dnsrrsig.VERDICT_NOT_ZONE_KEY)
+    test.case("flags 385: zone key and revoked")
+    let rv = key_of(0x0181, 15, rfc8080_ed25519_1_key())
+    let tag_rv = dnskey.key_tag(dk(0x0181, 15, rfc8080_ed25519_1_key()))
+    let s_rv = sig_of(15, 15, 2, 3600, 1440021600, 1438207200, tag_rv, "example.com.", rfc8080_ed25519_1_sig())
+    test.assert_eq(dnsrrsig.verify(rv, s_rv, rrset, 1439000000), dnsrrsig.VERDICT_NOT_ZONE_KEY)
+
+@test
+fn test_a_signature_that_does_not_belong_to_the_rrset_is_refused() [io]
+    let rrset = [mx_rr("example.com.", 10, "mail.example.com.")]
+    let k1 = key_of(257, 15, rfc8080_ed25519_1_key())
+    let sig = ed1_sig()
+    test.case("an empty RRset")
+    test.assert_eq(dnsrrsig.verify(k1, sig, [], 1439000000), dnsrrsig.VERDICT_RRSET_MISMATCH)
+    test.case("another type covered")
+    test.assert_eq(dnsrrsig.verify(k1,
+        sig_of(16, 15, 2, 3600, 1440021600, 1438207200, 3613, "example.com.", rfc8080_ed25519_1_sig()),
+        rrset,
+        1439000000),
+    dnsrrsig.VERDICT_RRSET_MISMATCH)
+    test.case("a Labels field above the owner's label count")
+    test.assert_eq(dnsrrsig.verify(k1,
+        sig_of(15, 15, 3, 3600, 1440021600, 1438207200, 3613, "example.com.", rfc8080_ed25519_1_sig()),
+        rrset,
+        1439000000),
+    dnsrrsig.VERDICT_RRSET_MISMATCH)
+    test.case("a signer that is not the owner or above it")
+    test.assert_eq(dnsrrsig.verify(k1,
+        sig_of(15, 15, 2, 3600, 1440021600, 1438207200, 3613, "example.org.", rfc8080_ed25519_1_sig()),
+        rrset,
+        1439000000),
+    dnsrrsig.VERDICT_RRSET_MISMATCH)
+    test.case("records with different owners, types or classes in one set")
+    test.assert_eq(dnsrrsig.verify(k1, sig, [mx_rr("example.com.", 10, "mail.example.com."),
+        mx_rr("a.example.com.", 10, "mail.example.com.")],
+    1439000000),
+    dnsrrsig.VERDICT_RRSET_MISMATCH)
+    test.assert_eq(dnsrrsig.verify(k1, sig, [mx_rr("example.com.", 10, "mail.example.com."),
+        dnsrr.rr(nm("example.com."), 16, 1, 3600, [0 as u8])],
+    1439000000),
+    dnsrrsig.VERDICT_RRSET_MISMATCH)
+    test.assert_eq(dnsrrsig.verify(k1, sig, [mx_rr("example.com.", 10, "mail.example.com."),
+        dnsrr.rr(nm("example.com."), 15, 3, 3600, [0 as u8])],
+    1439000000),
+    dnsrrsig.VERDICT_RRSET_MISMATCH)
+
+@test
+fn test_an_ed25519_key_of_the_wrong_length_is_refused() [io]
+    let rrset = [mx_rr("example.com.", 10, "mail.example.com.")]
+    let bad = dnskey.Dnskey { flags: 257,
+        protocol: 3,
+        algorithm: 15,
+        key: list.slice(b64(rfc8080_ed25519_1_key()), 0, 31) }
+    let tag = dnskey.key_tag(dnskey.dnskey_rdata(bad))
+    let s = sig_of(15, 15, 2, 3600, 1440021600, 1438207200, tag, "example.com.", rfc8080_ed25519_1_sig())
+    test.assert_eq(dnsrrsig.verify(bad, s, rrset, 1439000000), dnsrrsig.VERDICT_KEY_REFUSED)
+
+// ── RFC 6605: ECDSA P-256 ───────────────────────────────────────────
+
+// www.example.net. A 192.0.2.1
+fn www_a() -> dnsrr.DnsRr
+    dnsrr.rr(nm("www.example.net."), 1, 1, 3600, [192 as u8, 0 as u8, 2 as u8, 1 as u8])
+
+fn p256_sig() -> dnsrrsig.Rrsig
+    sig_of(1, 13, 3, 3600, 1284026679, 1281607479, 55648, "example.net.", rfc6605_p256_sig())
+
+@test
+fn test_the_ecdsa_p256_signature_of_rfc_6605_verifies() [io]
+    // 20100909100439 is 1284026679 and 20100812100439 is 1281607479.
+    let k = key_of(257, 13, rfc6605_p256_key())
+    test.assert_eq(dnsrrsig.verify(k, p256_sig(), [www_a()], 1282000000), dnsrrsig.VERDICT_OK)
+    test.assert_eq(dnsrrsig.verify(k, p256_sig(), [www_a()], 1281607479), dnsrrsig.VERDICT_OK)
+    test.assert_eq(dnsrrsig.verify(k, p256_sig(), [www_a()], 1284026680), dnsrrsig.VERDICT_EXPIRED)
+    test.case("another address")
+    test.assert_eq(dnsrrsig.verify(k,
+        p256_sig(),
+        [dnsrr.rr(nm("www.example.net."), 1, 1, 3600, [192 as u8, 0 as u8, 2 as u8, 2 as u8])],
+        1282000000),
+    dnsrrsig.VERDICT_SIGNATURE)
+    test.case("the TTL of the record is not part of what is checked")
+    test.assert_eq(dnsrrsig.verify(k,
+        p256_sig(),
+        [dnsrr.rr(nm("www.example.net."), 1, 1, 12, [192 as u8, 0 as u8, 2 as u8, 1 as u8])],
+        1282000000),
+    dnsrrsig.VERDICT_OK)
+    test.case("a signature of 63 bytes is refused as a signature")
+    let short = dnsrrsig.Rrsig { type_covered: 1,
+        algorithm: 13,
+        labels: 3,
+        original_ttl: 3600,
+        expiration: 1284026679,
+        inception: 1281607479,
+        key_tag: 55648,
+        signer: nm("example.net."),
+        signature: list.slice(b64(rfc6605_p256_sig()), 0, 63) }
+    test.assert_eq(dnsrrsig.verify(k, short, [www_a()], 1282000000), dnsrrsig.VERDICT_SIGNATURE)
+    test.case("a flipped bit")
+    var bad = list.clone(b64(rfc6605_p256_sig()))
+    bad[40] = (bad[40] as Int ^ 4) as u8
+    let flipped = dnsrrsig.Rrsig { type_covered: 1,
+        algorithm: 13,
+        labels: 3,
+        original_ttl: 3600,
+        expiration: 1284026679,
+        inception: 1281607479,
+        key_tag: 55648,
+        signer: nm("example.net."),
+        signature: bad }
+    test.assert_eq(dnsrrsig.verify(k, flipped, [www_a()], 1282000000), dnsrrsig.VERDICT_SIGNATURE)
+
+@test
+fn test_an_ecdsa_key_that_is_not_a_point_is_refused() [io]
+    test.case("63 bytes")
+    let short = dnskey.Dnskey { flags: 257,
+        protocol: 3,
+        algorithm: 13,
+        key: list.slice(b64(rfc6605_p256_key()), 0, 63) }
+    let tag_s = dnskey.key_tag(dnskey.dnskey_rdata(short))
+    let s_s = sig_of(1, 13, 3, 3600, 1284026679, 1281607479, tag_s, "example.net.", rfc6605_p256_sig())
+    test.assert_eq(dnsrrsig.verify(short, s_s, [www_a()], 1282000000), dnsrrsig.VERDICT_KEY_REFUSED)
+    test.case("64 bytes that are not on the curve")
+    var raw = list.clone(b64(rfc6605_p256_key()))
+    raw[63] = (raw[63] as Int ^ 1) as u8
+    let off = dnskey.Dnskey { flags: 257, protocol: 3, algorithm: 13, key: raw }
+    let tag_o = dnskey.key_tag(dnskey.dnskey_rdata(off))
+    let s_o = sig_of(1, 13, 3, 3600, 1284026679, 1281607479, tag_o, "example.net.", rfc6605_p256_sig())
+    test.assert_eq(dnsrrsig.verify(off, s_o, [www_a()], 1282000000), dnsrrsig.VERDICT_KEY_REFUSED)
+
+// ── The algorithms that are not verified ────────────────────────────
+
+@test
+fn test_the_other_algorithms_are_named_as_unsupported() [io]
+    test.case("RSA/SHA-1 (5): the key of RFC 4034 section 5.4 and the RRSIG of section 3.3")
+    let k5 = key_of(256, 5, rfc4034_dskey())
+    let tag5 = dnskey.key_tag(dk(256, 5, rfc4034_dskey()))
+    let a = dnsrr.rr(nm("host.example.com."), 1, 1, 86400, [192 as u8, 0 as u8, 2 as u8, 1 as u8])
+    let s5 = sig_of(1, 5, 3, 86400, 1048354263, 1045762263, tag5, "example.com.", rfc4034_rrsig())
+    test.assert_eq(dnsrrsig.verify(k5, s5, [a], 1046000000), dnsrrsig.VERDICT_ALGORITHM)
+    test.case("RSASHA1-NSEC3-SHA1 (7), RSA/SHA-512 (10), ECDSA P-384 (14) and Ed448 (16)")
+    for alg in [7, 10, 14, 16]
+        let k = dnskey.Dnskey { flags: 257, protocol: 3, algorithm: alg, key: [1 as u8, 2 as u8, 3 as u8] }
+        let t = dnskey.key_tag(dnskey.dnskey_rdata(k))
+        let s = sig_of(1, alg, 3, 86400, 1048354263, 1045762263, t, "example.com.", rfc4034_rrsig())
+        test.assert_eq(dnsrrsig.verify(k, s, [a], 1046000000), dnsrrsig.VERDICT_ALGORITHM)
+    test.assert_eq(dnsvalid.algorithm_supported(8), true)
+    test.assert_eq(dnsvalid.algorithm_supported(13), true)
+    test.assert_eq(dnsvalid.algorithm_supported(15), true)
+    test.assert_eq(dnsvalid.algorithm_supported(5), false)
+    test.assert_eq(dnsvalid.algorithm_supported(10), false)
+    test.assert_eq(dnsvalid.algorithm_supported(14), false)
+
+@test
+fn test_an_rsa_key_below_2048_bits_is_refused() [io]
+    // The 1024-bit key of RFC 4034 section 5.4, declared as algorithm 8.
+    let k = dnskey.Dnskey { flags: 256, protocol: 3, algorithm: 8, key: b64(rfc4034_dskey()) }
+    let tag = dnskey.key_tag(dnskey.dnskey_rdata(k))
+    let a = dnsrr.rr(nm("host.example.com."), 1, 1, 86400, [192 as u8, 0 as u8, 2 as u8, 1 as u8])
+    let s = sig_of(1, 8, 3, 86400, 1048354263, 1045762263, tag, "example.com.", rfc4034_rrsig())
+    test.assert_eq(dnsrrsig.verify(k, s, [a], 1046000000), dnsrrsig.VERDICT_KEY_REFUSED)
+    test.case("a key that has no modulus")
+    let bad = dnskey.Dnskey { flags: 256, protocol: 3, algorithm: 8, key: [1 as u8, 3 as u8] }
+    let tag2 = dnskey.key_tag(dnskey.dnskey_rdata(bad))
+    let s2 = sig_of(1, 8, 3, 86400, 1048354263, 1045762263, tag2, "example.com.", rfc4034_rrsig())
+    test.assert_eq(dnsrrsig.verify(bad, s2, [a], 1046000000), dnsrrsig.VERDICT_KEY_REFUSED)
+
+@test
+fn test_the_owner_that_was_signed_is_the_wildcard_when_labels_is_smaller() [io]
+    test.assert_eq(dns_codec.name_text(dnsrrsig.signed_owner(nm("a.b.sub.example."), 2)), "*.sub.example.")
+    test.assert_eq(dns_codec.name_text(dnsrrsig.signed_owner(nm("a.b.sub.example."), 3)), "*.b.sub.example.")
+    test.assert_eq(dns_codec.name_text(dnsrrsig.signed_owner(nm("a.b.sub.example."), 4)), "a.b.sub.example.")
+    test.assert_eq(dns_codec.name_text(dnsrrsig.signed_owner(nm("*.sub.example."), 2)), "*.sub.example.")
+    test.assert_eq(dns_codec.name_text(dnsrrsig.signed_owner(nm("a.example."), 0)), "*.")
+
+@test
+fn test_the_verdicts_have_words() [io]
+    test.assert_eq(dnsrrsig.verdict_name(0), "the signature is valid")
+    test.assert_eq(dnsrrsig.verdict_name(1), "the algorithm is not supported")
+    test.assert_eq(dnsrrsig.verdict_name(2), "the signature does not verify")
+    test.assert_eq(dnsrrsig.verdict_name(3), "the key tag or algorithm is not the key's")
+    test.assert_eq(dnsrrsig.verdict_name(4), "the signature has expired")
+    test.assert_eq(dnsrrsig.verdict_name(5), "the signature is not yet valid")
+    test.assert_eq(dnsrrsig.verdict_name(6), "the key is refused")
+    test.assert_eq(dnsrrsig.verdict_name(7), "the signature does not cover the RRset")
+    test.assert_eq(dnsrrsig.verdict_name(8), "the key is not a zone key or is revoked")
+    test.assert_eq(dnsrrsig.verdict_name(9), "unknown verdict")
+
+@test
+fn test_an_ed25519_key_with_a_non_canonical_y_is_refused() [io]
+    // y = p = 2^255 - 19 in 32 little-endian bytes: RFC 8032 section 5.1.3
+    // refuses to decode it.
+    let rrset = [mx_rr("example.com.", 10, "mail.example.com.")]
+    let bad = dnskey.Dnskey { flags: 257,
+        protocol: 3,
+        algorithm: 15,
+        key: hexb("ed" + "ff".repeat(30) + "7f") }
+    let tag = dnskey.key_tag(dnskey.dnskey_rdata(bad))
+    let s = sig_of(15, 15, 3, 3600, 1440021600, 1438207200, tag, "example.com.", rfc8080_ed25519_1_sig())
+    test.assert_eq(dnsrrsig.verify_signature(bad, s, rrset), dnsrrsig.VERDICT_KEY_REFUSED)
